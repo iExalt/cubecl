@@ -226,6 +226,20 @@ impl<H> core::ops::Deref for DeviceFixture<H> {
     }
 }
 
+/// Stops and joins every device runner.
+///
+/// New submissions must stop before this function is called.
+pub fn shutdown_device_services() {
+    #[cfg(all(feature = "std", multi_threading))]
+    channel::shutdown_device_services();
+}
+
+/// Registers process-exit shutdown after a dynamically loaded backend library.
+pub fn register_device_services_shutdown_hook() {
+    #[cfg(all(feature = "std", multi_threading))]
+    channel::register_shutdown_hook();
+}
+
 #[cfg(test)]
 mod tests_channel {
     type DeviceHandle<S> = super::DeviceHandle<S, channel::ChannelDeviceHandle>;

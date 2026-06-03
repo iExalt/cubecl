@@ -25,7 +25,10 @@ pub mod device;
 
 /// Device handle module.
 pub mod device_handle {
-    pub use super::device::handle::{CallError, CallResultExt, DeviceHandle};
+    pub use super::device::handle::{
+        CallError, CallResultExt, DeviceHandle, register_device_services_shutdown_hook,
+        shutdown_device_services,
+    };
 }
 
 /// Utilities module to manipulate bytes.
