@@ -12,6 +12,7 @@ use std::{
     cell::RefCell,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
+    vec::Vec,
 };
 
 use custom_channel::DeviceClient;
@@ -244,6 +245,52 @@ static RUNNERS: spin::Mutex<Option<HashMap<RunnerId, DeviceClient>>> = spin::Mut
 static CHANNELS: spin::Mutex<Option<HashMap<(RunnerId, TypeId), ChannelDeviceState>>> =
     spin::Mutex::new(None);
 
+/// Stops and joins every device runner.
+///
+/// New submissions must stop before this function is called. Runners are shut
+/// down upstream-first so queued producer work is cancelled before downstream
+/// services are dropped.
+pub fn shutdown_device_services() {
+    let channels = CHANNELS.lock().take();
+
+    let mut runners = RUNNERS
+        .lock()
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+    runners.sort_by_key(|(runner_id, _)| runner_id.stage as u8);
+
+    for (_, runner) in runners {
+        runner.shutdown();
+    }
+
+    core::mem::drop(channels);
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn atexit(callback: extern "C" fn()) -> core::ffi::c_int;
+}
+
+#[cfg(unix)]
+extern "C" fn shutdown_device_services_at_exit() {
+    if catch_unwind(shutdown_device_services).is_err() {
+        log::warn!("Device-service shutdown hook failed");
+    }
+}
+
+#[cfg(unix)]
+pub fn register_shutdown_hook() {
+    // SAFETY: The callback has C ABI, takes no arguments, and remains valid
+    // for the lifetime of the process.
+    let result = unsafe { atexit(shutdown_device_services_at_exit) };
+    assert_eq!(result, 0, "Failed to register device-service shutdown hook");
+}
+
+#[cfg(not(unix))]
+pub fn register_shutdown_hook() {}
+
 impl ChannelDeviceState {
     pub fn init<S: DeviceService>(
         device_id: DeviceId,
@@ -334,6 +381,7 @@ impl ChannelDeviceState {
                 ));
             }
         };
+        register_shutdown_hook();
 
         let channel = Self {
             client: device_client,
@@ -402,7 +450,7 @@ mod task {
     pub const GLOBAL_TASK_MAX_SIZE: usize = 4096;
 
     /// The maximum size of a closure that can be stored using inlined memory.
-    const INLINE_TASK_MAX_SIZE: usize = 48;
+    const INLINE_TASK_MAX_SIZE: usize = 40;
 
     /// One arena slot. `#[repr(C, align(64))]` makes every slot 64-byte
     /// aligned on its own, so the slot alignment does not depend on the layout of any
@@ -419,12 +467,14 @@ mod task {
     /// It fits in 64 bytes, ensuring multiple threads can initialize tasks at the same time
     /// without causing false sharing.
     pub struct Task {
-        // 48 bytes; 64-aligned because it is the first field of a 64-aligned struct.
+        // 40 bytes; 64-aligned because it is the first field of a 64-aligned struct.
         data: [u8; INLINE_TASK_MAX_SIZE],
         // 8 bytes (usize/u64 ptr)
         data_large_ptr: AtomicPtr<u8>,
         // 8 bytes (usize/u64 ptr)
         fn_ptr: fn(&mut Task),
+        // 8 bytes (usize/u64 ptr)
+        drop_ptr: fn(&mut Task),
     }
 
     const _: () = {
@@ -443,6 +493,7 @@ mod task {
                 data: [0u8; INLINE_TASK_MAX_SIZE],
                 data_large_ptr: AtomicPtr::new(large_data_ptr),
                 fn_ptr: |_| {},
+                drop_ptr: |_| {},
             }
         }
 
@@ -467,6 +518,10 @@ mod task {
                         log::warn!("Task failed: {err:?}");
                     }
                 };
+                self.drop_ptr = |task| {
+                    // SAFETY: Paired with the ptr::write to data above.
+                    unsafe { std::ptr::drop_in_place(task.data.as_mut_ptr() as *mut F) };
+                };
             } else if fits_arena {
                 // SAFETY: size + align checked above, read back exactly once by fn_ptr.
                 unsafe {
@@ -481,6 +536,14 @@ mod task {
                         log::warn!("Task failed: {err:?}");
                     }
                 };
+                self.drop_ptr = |task| {
+                    // SAFETY: Paired with the ptr::write to data_large_ptr above.
+                    unsafe {
+                        std::ptr::drop_in_place(
+                            task.data_large_ptr.load(Ordering::Relaxed) as *mut F
+                        )
+                    };
+                };
             } else {
                 // Size or alignment exceeds both slots. Heap-allocate to get a
                 // properly-aligned, pointer-sized handle, then recurse as an inline
@@ -493,10 +556,23 @@ mod task {
         /// Runs the task.
         ///
         /// The task must be initialized and run only once per initialization.
-        /// Tasks must run, otherwise we will create memory leaks since we don't
-        /// drop tasks that aren't executed.
         pub fn run(&mut self) {
-            (self.fn_ptr)(self)
+            let fn_ptr = core::mem::replace(&mut self.fn_ptr, |_| {});
+            self.drop_ptr = |_| {};
+            fn_ptr(self)
+        }
+
+        /// Drops an initialized task without running it.
+        fn discard(&mut self) {
+            let drop_ptr = core::mem::replace(&mut self.drop_ptr, |_| {});
+            self.fn_ptr = |_| {};
+            drop_ptr(self)
+        }
+    }
+
+    impl Drop for Task {
+        fn drop(&mut self) {
+            self.discard();
         }
     }
 }
@@ -577,10 +653,14 @@ mod custom_channel {
     };
     use core::{
         hint::spin_loop,
-        sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+        sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
         time::Duration,
     };
-    use std::{sync::Arc, vec::Vec};
+    use std::{
+        sync::{Arc, Mutex},
+        thread::JoinHandle,
+        vec::Vec,
+    };
 
     /// Maximum number of [`Task`] that can be queued.
     pub const CHANNEL_MAX_TASK: usize = 32;
@@ -613,12 +693,14 @@ mod custom_channel {
     /// The client-side handle used to enqueue tasks.
     pub struct DeviceClient {
         state: Arc<State>,
+        join_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     }
 
     impl Clone for DeviceClient {
         fn clone(&self) -> Self {
             Self {
                 state: self.state.clone(),
+                join_handle: self.join_handle.clone(),
             }
         }
     }
@@ -633,7 +715,7 @@ mod custom_channel {
             let mut server = Server::new(runner_id);
             let state = server.state.clone();
 
-            std::thread::Builder::new()
+            let join_handle = std::thread::Builder::new()
                 .name(std::format!(
                     "DS{}-{}-{}",
                     match runner_id.stage {
@@ -649,11 +731,30 @@ mod custom_channel {
                 })
                 .unwrap();
 
-            Self { state }
+            Self {
+                state,
+                join_handle: Arc::new(Mutex::new(Some(join_handle))),
+            }
         }
 
         /// Atomically reserves a slot in the buffer and writes the task.
         pub fn enqueue<F: FnOnce() + Send + 'static>(&self, func: F) -> Result<(), CallError> {
+            if !self.state.accepting.load(Ordering::Acquire) {
+                return Err(CallError);
+            }
+            self.state.active_enqueues.fetch_add(1, Ordering::AcqRel);
+            if !self.state.accepting.load(Ordering::Acquire) {
+                self.state.active_enqueues.fetch_sub(1, Ordering::AcqRel);
+                return Err(CallError);
+            }
+
+            self.enqueue_unchecked(func);
+            self.state.active_enqueues.fetch_sub(1, Ordering::AcqRel);
+
+            Ok(())
+        }
+
+        fn enqueue_unchecked<F: FnOnce() + Send + 'static>(&self, func: F) {
             let mut idle_count: u32 = 0;
             loop {
                 let index = self.state.available_index.fetch_add(1, Ordering::Acquire) as usize;
@@ -672,7 +773,7 @@ mod custom_channel {
 
                 self.state.init_task_at(index, func);
                 self.state.enqueued_count.fetch_add(1, Ordering::SeqCst);
-                return Ok(());
+                return;
             }
         }
 
@@ -704,6 +805,23 @@ mod custom_channel {
                 .enqueued_count
                 .fetch_add(actual_added as u32, Ordering::SeqCst);
         }
+
+        /// Stops accepting work, cancels queued tasks, and joins the runner.
+        pub fn shutdown(&self) {
+            if self.state.accepting.swap(false, Ordering::AcqRel) {
+                while self.state.active_enqueues.load(Ordering::Acquire) != 0 {
+                    std::thread::yield_now();
+                }
+
+                self.state.shutdown_requested.store(true, Ordering::Release);
+            }
+
+            if let Some(join_handle) = self.join_handle.lock().unwrap().take()
+                && join_handle.join().is_err()
+            {
+                log::warn!("Device runner thread failed during shutdown");
+            }
+        }
     }
 
     struct State {
@@ -716,6 +834,12 @@ mod custom_channel {
         available_index: AtomicU32,
         /// Number of tasks successfully written and ready for processing.
         enqueued_count: AtomicU32,
+        /// Whether clients may enqueue new work.
+        accepting: AtomicBool,
+        /// Number of clients currently writing queue slots.
+        active_enqueues: AtomicU32,
+        /// Whether the server should stop after draining its current task buffer.
+        shutdown_requested: AtomicBool,
         /// The runner id (for debugging purposes).
         runner_id: RunnerId,
     }
@@ -773,6 +897,9 @@ mod custom_channel {
                 queue_ptr: AtomicPtr::new(buffers[0].tasks.as_mut_ptr()),
                 available_index: AtomicU32::new(0),
                 enqueued_count: AtomicU32::new(0),
+                accepting: AtomicBool::new(true),
+                active_enqueues: AtomicU32::new(0),
+                shutdown_requested: AtomicBool::new(false),
                 runner_id,
             });
 
@@ -788,6 +915,10 @@ mod custom_channel {
         fn start(&mut self) {
             let mut idle_count: u32 = 0;
             loop {
+                if self.state.shutdown_requested.load(Ordering::Acquire) {
+                    return;
+                }
+
                 if self.ready_to_execute {
                     self.execute_tasks();
                     idle_count = 0;
@@ -1015,14 +1146,14 @@ mod tests {
 
     #[test]
     fn test_large_closure_uses_arena() {
-        // Closure captures > 48 bytes (InlineSlot), forcing the arena path.
+        // Closure captures > 40 bytes (InlineSlot), forcing the arena path.
         let device_id = DeviceId {
             type_id: 0,
             index_id: 7,
         };
         let handle = ChannelDeviceHandle::<MockService>::new(device_id);
 
-        let big_data = [42u8; 128]; // 128 bytes > 48 byte inline limit
+        let big_data = [42u8; 128]; // 128 bytes > 40 byte inline limit
         let result = handle
             .submit_blocking(move |_state| {
                 // Use big_data to prevent it from being optimized away.
@@ -1062,7 +1193,7 @@ mod tests {
 
         struct DropSpy {
             counter: Arc<AtomicUsize>,
-            _padding: [u8; 128], // Force arena path (> 48 bytes)
+            _padding: [u8; 128], // Force arena path (> 40 bytes)
         }
         impl Drop for DropSpy {
             fn drop(&mut self) {
@@ -1251,5 +1382,60 @@ mod tests {
             let _: usize = d.data.iter().map(|&b| b as usize).sum();
         });
         task.run();
+    }
+
+    #[test]
+    fn test_task_drop_discards_closure_captures_without_running() {
+        use super::task::{ArenaSlot, GLOBAL_TASK_MAX_SIZE, Task};
+
+        struct DropSpy<const N: usize> {
+            counter: Arc<AtomicUsize>,
+            _padding: [u8; N],
+        }
+
+        impl<const N: usize> Drop for DropSpy<N> {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn assert_discarded<F: FnOnce() + Send + 'static>(
+            task_fn: F,
+            drop_count: &Arc<AtomicUsize>,
+            run_count: &Arc<AtomicUsize>,
+        ) {
+            let mut arena = alloc::boxed::Box::new(ArenaSlot {
+                data: [0u8; GLOBAL_TASK_MAX_SIZE],
+            });
+            let mut task = Task::new(arena.data.as_mut_ptr());
+            task.init(task_fn);
+            drop(task);
+
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+            assert_eq!(run_count.load(Ordering::SeqCst), 0);
+        }
+
+        fn run_case<const N: usize>() {
+            let drop_count = Arc::new(AtomicUsize::new(0));
+            let run_count = Arc::new(AtomicUsize::new(0));
+            let spy = DropSpy {
+                counter: Arc::clone(&drop_count),
+                _padding: [0; N],
+            };
+            let run_count_task = Arc::clone(&run_count);
+
+            assert_discarded(
+                move || {
+                    let _ = &spy;
+                    run_count_task.fetch_add(1, Ordering::SeqCst);
+                },
+                &drop_count,
+                &run_count,
+            );
+        }
+
+        run_case::<0>();
+        run_case::<128>();
+        run_case::<8192>();
     }
 }

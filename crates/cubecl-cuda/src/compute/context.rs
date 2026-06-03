@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::c_char;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::{ffi::CStr, os::raw::c_void};
 
 use cubecl_common::cache::CacheOption;
@@ -50,6 +50,39 @@ pub struct CompiledKernel {
     func: *mut CUfunc_st,
 }
 
+struct NvrtcProgram(cudarc::nvrtc::sys::nvrtcProgram);
+
+impl Drop for NvrtcProgram {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a live NVRTC program created by `create_program`
+        // and this guard owns the only destruction call.
+        if let Err(err) = unsafe { cudarc::nvrtc::result::destroy_program(self.0) } {
+            log::warn!("Unable to destroy NVRTC program: {err}");
+        }
+    }
+}
+
+fn initialize_nvrtc_shutdown() {
+    static INITIALIZE: Once = Once::new();
+    INITIALIZE.call_once(|| {
+        // Compile once during CUDA server initialization so NVRTC's nested
+        // builtins library is loaded before the process-exit shutdown hook.
+        let source =
+            CString::new("extern \"C\" __global__ void cubecl_shutdown_init() {}").unwrap();
+        // SAFETY: Calling NVRTC FFI with a null-terminated source string that
+        // outlives the program. The guard destroys the program after registration.
+        unsafe {
+            let program = NvrtcProgram(
+                cudarc::nvrtc::result::create_program(source.as_c_str(), None)
+                    .expect("NVRTC shutdown initialization should create a program"),
+            );
+            cudarc::nvrtc::result::compile_program(program.0, &[] as &[&str])
+                .expect("NVRTC shutdown initialization should compile");
+            cubecl_common::device_handle::register_device_services_shutdown_hook();
+        }
+    });
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone)]
 pub struct PtxCacheEntry {
     entrypoint_name: String,
@@ -64,6 +97,7 @@ impl CudaContext {
         context: *mut CUctx_st,
         arch: CudaArchitecture,
     ) -> Self {
+        initialize_nvrtc_shutdown();
         Self {
             context,
             module_names: HashMap::new(),
@@ -168,15 +202,17 @@ impl CudaContext {
             // I'd like to set the name to the kernel name, but keep getting UTF-8 errors so let's
             // leave it `None` for now
             let source = CString::from_str(&kernel_compiled.source).unwrap();
-            let program =
+            let program = NvrtcProgram(
                 cudarc::nvrtc::result::create_program(source.as_c_str(), None).map_err(|err| {
                     CompilationError::Generic {
                         reason: format!("{err}"),
                         backtrace: BackTrace::capture(),
                     }
-                })?;
-            if cudarc::nvrtc::result::compile_program(program, &options).is_err() {
-                let log_raw = cudarc::nvrtc::result::get_program_log(program).map_err(|err| {
+                })?,
+            );
+            let compilation_result = cudarc::nvrtc::result::compile_program(program.0, &options);
+            if compilation_result.is_err() {
+                let log_raw = cudarc::nvrtc::result::get_program_log(program.0).map_err(|err| {
                     CompilationError::Generic {
                         reason: format!("{err}"),
                         backtrace: BackTrace::capture(),
@@ -204,7 +240,7 @@ impl CudaContext {
                     backtrace: BackTrace::capture(),
                 })?;
             };
-            cudarc::nvrtc::result::get_ptx(program).map_err(|err| CompilationError::Generic {
+            cudarc::nvrtc::result::get_ptx(program.0).map_err(|err| CompilationError::Generic {
                 reason: format!("{err}"),
                 backtrace: BackTrace::capture(),
             })?

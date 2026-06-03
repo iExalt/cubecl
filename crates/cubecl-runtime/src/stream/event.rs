@@ -12,6 +12,7 @@ use std::{
     boxed::Box,
     format,
     sync::{Arc, mpsc::SyncSender},
+    thread::JoinHandle,
     vec::Vec,
 };
 
@@ -119,24 +120,43 @@ impl<B: EventStreamBackend> StreamFactory for EventStreamBackendWrapper<B> {
 
 #[derive(Debug)]
 struct GcThread<B: EventStreamBackend> {
-    sender: SyncSender<GcTask<B>>,
+    sender: Option<SyncSender<GcTask<B>>>,
+    join_handle: Option<JoinHandle<()>>,
 }
 
 impl<B: EventStreamBackend> GcThread<B> {
     fn new() -> GcThread<B> {
         let (sender, recv) = std::sync::mpsc::sync_channel::<GcTask<B>>(8);
 
-        std::thread::spawn(move || {
+        let join_handle = std::thread::spawn(move || {
             while let Ok(event) = recv.recv() {
                 B::wait_event_sync(event.event).unwrap();
                 core::mem::drop(event.to_drop);
             }
         });
 
-        GcThread { sender }
+        GcThread {
+            sender: Some(sender),
+            join_handle: Some(join_handle),
+        }
     }
     fn register(&self, task: GcTask<B>) {
-        self.sender.send(task).unwrap()
+        self.sender.as_ref().unwrap().send(task).unwrap()
+    }
+
+    fn shutdown(&mut self) {
+        core::mem::drop(self.sender.take());
+        if let Some(join_handle) = self.join_handle.take()
+            && join_handle.join().is_err()
+        {
+            log::warn!("Stream garbage-collection thread failed during shutdown");
+        }
+    }
+}
+
+impl<B: EventStreamBackend> Drop for GcThread<B> {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -159,7 +179,7 @@ impl<'a, B: EventStreamBackend> ResolvedStreams<'a, B> {
 
     /// Enqueue a task to be cleaned.
     pub fn gc(&mut self, gc: GcTask<B>) {
-        self.gc.sender.send(gc).unwrap();
+        self.gc.register(gc);
     }
 }
 
@@ -206,7 +226,7 @@ impl<B: EventStreamBackend> MultiStream<B> {
 
     /// Enqueue a task to be cleaned.
     pub fn gc(&mut self, gc: GcTask<B>) {
-        self.gc.sender.send(gc).unwrap();
+        self.gc.register(gc);
     }
 
     /// Resolves and returns a mutable reference to the stream for the given ID, performing any necessary
@@ -353,6 +373,12 @@ impl<B: EventStreamBackend> MultiStream<B> {
         }
 
         analysis
+    }
+}
+
+impl<B: EventStreamBackend> Drop for MultiStream<B> {
+    fn drop(&mut self) {
+        self.gc.shutdown();
     }
 }
 
