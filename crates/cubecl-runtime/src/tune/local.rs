@@ -131,7 +131,7 @@ where
         let mut checks_outputs = Vec::new();
         for i in 0..operations.len() {
             let op = operations.fastest(i);
-            let result = op.execute(inputs.clone());
+            let result = op.execute(I::clone_for_check(inputs));
             checks_outputs.push(result);
         }
         super::check_autotune_outputs(checks_outputs);

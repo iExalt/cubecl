@@ -4,6 +4,8 @@ use crate::dummy::{DummyDevice, DummyElementwiseAddition, test_client};
 
 use cubecl_runtime::local_tuner;
 use cubecl_runtime::server::{CubeCount, Handle, KernelArguments};
+#[cfg(feature = "autotune-checks")]
+use cubecl_runtime::tune::TuneInputs;
 use cubecl_runtime::tune::{AutotuneOutput, CloneInputGenerator, LocalTuner, Tunable, TunableSet};
 use dummy::*;
 #[cfg(feature = "autotune-checks")]
@@ -22,6 +24,26 @@ struct CheckCountOutput {
 impl AutotuneOutput for CheckCountOutput {
     fn check_equivalence(&self, _other: Self) {
         self.checks.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "autotune-checks")]
+#[derive(Clone)]
+struct CheckInput {
+    handles: Vec<Handle>,
+    clones: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "autotune-checks")]
+struct CheckTuneInputs;
+
+#[cfg(feature = "autotune-checks")]
+impl TuneInputs for CheckTuneInputs {
+    type At<'a> = CheckInput;
+
+    fn clone_for_check<'a>(inputs: &Self::At<'a>) -> Self::At<'a> {
+        inputs.clones.fetch_add(1, Ordering::SeqCst);
+        inputs.clone()
     }
 }
 
@@ -128,10 +150,14 @@ fn autotune_checks_once_per_key() {
     let lhs = client.create_from_slice(&[0, 1, 2]);
     let rhs = client.create_from_slice(&[4, 4, 4]);
     let out = client.empty(3);
-    let handles = vec![lhs, rhs, out];
+    let clones = Arc::new(AtomicUsize::new(0));
+    let inputs = CheckInput {
+        handles: vec![lhs, rhs, out],
+        clones: clones.clone(),
+    };
     let checks = Arc::new(AtomicUsize::new(0));
 
-    let test_set: Arc<TunableSet<String, Vec<Handle>, CheckCountOutput>> = TUNER.init({
+    let test_set: Arc<TunableSet<String, CheckTuneInputs, CheckCountOutput>> = TUNER.init({
         let checks = checks.clone();
         move || {
             let client = test_client(&DummyDevice);
@@ -145,13 +171,13 @@ fn autotune_checks_once_per_key() {
             );
 
             TunableSet::new(
-                |_inputs: &Vec<Handle>| "autotune-checks-once".to_string(),
+                |_inputs: &CheckInput| "autotune-checks-once".to_string(),
                 CloneInputGenerator,
             )
             .with(Tunable::new("add", {
                 let checks = checks.clone();
-                move |inputs| {
-                    add.run(inputs)?;
+                move |inputs: CheckInput| {
+                    add.run(inputs.handles)?;
                     Ok::<_, String>(CheckCountOutput {
                         checks: checks.clone(),
                     })
@@ -159,8 +185,8 @@ fn autotune_checks_once_per_key() {
             }))
             .with(Tunable::new("add_slow_wrong", {
                 let checks = checks.clone();
-                move |inputs| {
-                    add_slow_wrong.run(inputs)?;
+                move |inputs: CheckInput| {
+                    add_slow_wrong.run(inputs.handles)?;
                     Ok::<_, String>(CheckCountOutput {
                         checks: checks.clone(),
                     })
@@ -170,13 +196,16 @@ fn autotune_checks_once_per_key() {
     });
 
     let id = "test".to_string();
-    let _ = TUNER.execute(&id, &client, test_set.clone(), handles.clone());
+    let _ = TUNER.execute(&id, &client, test_set.clone(), inputs.clone());
     assert_eq!(1, checks.load(Ordering::SeqCst));
+    assert_eq!(2, clones.load(Ordering::SeqCst));
 
-    let _ = TUNER.execute(&id, &client, test_set.clone(), handles.clone());
+    let _ = TUNER.execute(&id, &client, test_set.clone(), inputs.clone());
     assert_eq!(1, checks.load(Ordering::SeqCst));
+    assert_eq!(2, clones.load(Ordering::SeqCst));
 
     TUNER.clear();
-    let _ = TUNER.execute(&id, &client, test_set, handles);
+    let _ = TUNER.execute(&id, &client, test_set, inputs);
     assert_eq!(2, checks.load(Ordering::SeqCst));
+    assert_eq!(4, clones.load(Ordering::SeqCst));
 }

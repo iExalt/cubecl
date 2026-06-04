@@ -15,6 +15,14 @@
 pub trait TuneInputs: Send + Sync + 'static {
     /// The concrete input type at lifetime `'a`.
     type At<'a>: Clone + Send;
+
+    /// Clone inputs for one autotune correctness check candidate.
+    ///
+    /// The default is a regular clone. Implementers whose clones share mutable storage can
+    /// override this to isolate candidate executions without changing benchmark input generation.
+    fn clone_for_check<'a>(inputs: &Self::At<'a>) -> Self::At<'a> {
+        inputs.clone()
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static> TuneInputs for T {
