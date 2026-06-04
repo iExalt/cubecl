@@ -10,6 +10,8 @@ use core::{
     hash::Hash,
 };
 use cubecl_environment::collections::HashMap;
+#[cfg(feature = "autotune-checks")]
+use cubecl_environment::collections::HashSet;
 use cubecl_environment::sync::{Mutex, RwLock};
 
 /// The tunable sets a [`LocalTuner`] has built, keyed by device as well as by
@@ -22,6 +24,8 @@ type Sets<ID> = RwLock<Option<HashMap<(TypeId, ID), Arc<dyn Any + Send + Sync>>>
 /// key.
 pub struct LocalTuner<AK: AutotuneKey, ID> {
     state: Mutex<Option<HashMap<ID, Arc<Tuner<AK>>>>>,
+    #[cfg(feature = "autotune-checks")]
+    checked_keys: Mutex<Option<HashSet<(u32, ID, AK)>>>,
     name: &'static str,
     sets: Sets<ID>,
 }
@@ -48,6 +52,8 @@ where
     pub const fn new(name: &'static str) -> Self {
         Self {
             state: Mutex::new(None),
+            #[cfg(feature = "autotune-checks")]
+            checked_keys: Mutex::new(None),
             name,
             sets: RwLock::new(None),
         }
@@ -112,11 +118,17 @@ where
         if let Some(s) = self.state.lock().as_mut() {
             s.clear()
         }
+        #[cfg(feature = "autotune-checks")]
+        if let Some(keys) = self.checked_keys.lock().as_mut() {
+            keys.clear()
+        }
     }
 
     #[cfg(feature = "autotune-checks")]
-    fn checks<'a, I: TuneInputs, Out: AutotuneOutput>(
+    fn checks_once<'a, I: TuneInputs, Out: AutotuneOutput>(
         &self,
+        id: &ID,
+        key: &AK,
         operations: &TunableSet<AK, I, Out>,
         inputs: &<I as TuneInputs>::At<'a>,
     ) -> alloc::vec::Vec<crate::tune::log::CheckResult>
@@ -125,13 +137,29 @@ where
     {
         use alloc::vec::Vec;
 
+        let generation = cubecl_environment::environment::generation();
+        let checked_key = (generation, id.clone(), key.clone());
+        if self
+            .checked_keys
+            .lock()
+            .as_ref()
+            .is_some_and(|keys| keys.contains(&checked_key))
+        {
+            return Vec::new();
+        }
+
         let mut checks_outputs = Vec::new();
         for i in 0..operations.len() {
             let op = operations.fastest(i);
             let result = op.execute(inputs.clone());
             checks_outputs.push((op.name.to_string(), result));
         }
-        super::check_autotune_outputs(checks_outputs)
+        let checks = super::check_autotune_outputs(checks_outputs);
+        self.checked_keys
+            .lock()
+            .get_or_insert_with(HashSet::new)
+            .insert(checked_key);
+        checks
     }
 
     /// Execute the fastest operation in a [`TunableSet`], triggering a tuning pass on
@@ -165,7 +193,7 @@ where
         let mut log_context = crate::tune::AutotuneLogContext::new(&mut tuner.logger().lock());
 
         #[cfg(feature = "autotune-checks")]
-        log_context.set_checks(|| self.checks::<I, Out>(&operations, &inputs));
+        log_context.set_checks(|| self.checks_once::<I, Out>(id, &key, &operations, &inputs));
 
         // Fast path: a cached hit skips straight to the fastest operation.
         // `fastest` also resets the tuner cache if the environment switched, so
