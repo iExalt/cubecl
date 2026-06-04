@@ -8,12 +8,16 @@ use core::{
     hash::Hash,
 };
 use hashbrown::HashMap;
+#[cfg(feature = "autotune-checks")]
+use hashbrown::HashSet;
 use spin::Mutex;
 
 /// A local tuner allows to create a tuner for a specific key that can be different from the server
 /// key.
 pub struct LocalTuner<AK: AutotuneKey, ID> {
     state: Mutex<Option<HashMap<ID, Arc<Tuner<AK>>>>>,
+    #[cfg(feature = "autotune-checks")]
+    checked_keys: Mutex<Option<HashSet<(ID, AK)>>>,
     name: &'static str,
     sets: spin::RwLock<Option<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
 }
@@ -40,6 +44,8 @@ where
     pub const fn new(name: &'static str) -> Self {
         Self {
             state: Mutex::new(None),
+            #[cfg(feature = "autotune-checks")]
+            checked_keys: Mutex::new(None),
             name,
             sets: spin::RwLock::new(None),
         }
@@ -94,17 +100,33 @@ where
         if let Some(s) = self.state.lock().as_mut() {
             s.clear()
         }
+        #[cfg(feature = "autotune-checks")]
+        if let Some(keys) = self.checked_keys.lock().as_mut() {
+            keys.clear()
+        }
     }
 
     #[cfg(feature = "autotune-checks")]
-    fn checks<'a, I: TuneInputs, Out: AutotuneOutput>(
+    fn checks_once<'a, I: TuneInputs, Out: AutotuneOutput>(
         &self,
+        id: &ID,
+        key: &AK,
         operations: &TunableSet<AK, I, Out>,
         inputs: &<I as TuneInputs>::At<'a>,
     ) where
         <I as TuneInputs>::At<'a>: Clone + Send,
     {
         use alloc::vec::Vec;
+
+        let checked_key = (id.clone(), key.clone());
+        if self
+            .checked_keys
+            .lock()
+            .as_ref()
+            .is_some_and(|keys| keys.contains(&checked_key))
+        {
+            return;
+        }
 
         let mut checks_outputs = Vec::new();
         for i in 0..operations.len() {
@@ -113,6 +135,11 @@ where
             checks_outputs.push(result);
         }
         super::check_autotune_outputs(checks_outputs);
+
+        self.checked_keys
+            .lock()
+            .get_or_insert_with(HashSet::new)
+            .insert(checked_key);
     }
 
     /// Execute the fastest operation in a [`TunableSet`], triggering a tuning pass on
@@ -145,7 +172,7 @@ where
         // First, check for a cache hit under a read lock.
         if let TuneCacheResult::Hit { fastest_index } = tuner.fastest(&key) {
             #[cfg(feature = "autotune-checks")]
-            self.checks::<I, Out>(&operations, &inputs);
+            self.checks_once::<I, Out>(id, &key, &operations, &inputs);
             return operations
                 .fastest(fastest_index)
                 .execute(inputs)
@@ -164,7 +191,7 @@ where
         match fastest {
             TuneCacheResult::Hit { fastest_index } => {
                 #[cfg(feature = "autotune-checks")]
-                self.checks::<I, Out>(&operations, &inputs);
+                self.checks_once::<I, Out>(id, &key, &operations, &inputs);
 
                 operations
                     .fastest(fastest_index)

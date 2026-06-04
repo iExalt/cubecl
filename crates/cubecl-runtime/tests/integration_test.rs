@@ -2,10 +2,28 @@ mod dummy;
 
 use crate::dummy::{DummyDevice, DummyElementwiseAddition, test_client};
 
-use cubecl_runtime::server::CubeCount;
-use cubecl_runtime::server::KernelArguments;
-use cubecl_runtime::{local_tuner, tune::LocalTuner};
+use cubecl_runtime::local_tuner;
+use cubecl_runtime::server::{CubeCount, Handle, KernelArguments};
+use cubecl_runtime::tune::{AutotuneOutput, CloneInputGenerator, LocalTuner, Tunable, TunableSet};
 use dummy::*;
+#[cfg(feature = "autotune-checks")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+#[cfg(feature = "autotune-checks")]
+#[derive(Clone)]
+struct CheckCountOutput {
+    checks: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "autotune-checks")]
+impl AutotuneOutput for CheckCountOutput {
+    fn check_equivalence(&self, _other: Self) {
+        self.checks.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 #[test_log::test]
 fn created_resource_is_the_same_when_read() {
@@ -99,4 +117,66 @@ fn autotune_basic_multiplication_execution() {
 
     // If slow kernel was selected it would output [0, 1, 2]
     assert_eq!(obtained_resource, Vec::from([0, 4, 8]));
+}
+
+#[test_log::test]
+#[cfg(all(feature = "std", feature = "autotune-checks"))]
+fn autotune_checks_once_per_key() {
+    static TUNER: LocalTuner<String, String> = local_tuner!("autotune_checks_once_per_key");
+
+    let client = test_client(&DummyDevice);
+    let lhs = client.create_from_slice(&[0, 1, 2]);
+    let rhs = client.create_from_slice(&[4, 4, 4]);
+    let out = client.empty(3);
+    let handles = vec![lhs, rhs, out];
+    let checks = Arc::new(AtomicUsize::new(0));
+
+    let test_set: Arc<TunableSet<String, Vec<Handle>, CheckCountOutput>> = TUNER.init({
+        let checks = checks.clone();
+        move || {
+            let client = test_client(&DummyDevice);
+            let add = OneKernelAutotuneOperation::new(
+                KernelTask::new(DummyElementwiseAddition),
+                client.clone(),
+            );
+            let add_slow_wrong = OneKernelAutotuneOperation::new(
+                KernelTask::new(DummyElementwiseAdditionSlowWrong),
+                client,
+            );
+
+            TunableSet::new(
+                |_inputs: &Vec<Handle>| "autotune-checks-once".to_string(),
+                CloneInputGenerator,
+            )
+            .with(Tunable::new("add", {
+                let checks = checks.clone();
+                move |inputs| {
+                    add.run(inputs)?;
+                    Ok::<_, String>(CheckCountOutput {
+                        checks: checks.clone(),
+                    })
+                }
+            }))
+            .with(Tunable::new("add_slow_wrong", {
+                let checks = checks.clone();
+                move |inputs| {
+                    add_slow_wrong.run(inputs)?;
+                    Ok::<_, String>(CheckCountOutput {
+                        checks: checks.clone(),
+                    })
+                }
+            }))
+        }
+    });
+
+    let id = "test".to_string();
+    let _ = TUNER.execute(&id, &client, test_set.clone(), handles.clone());
+    assert_eq!(1, checks.load(Ordering::SeqCst));
+
+    let _ = TUNER.execute(&id, &client, test_set.clone(), handles.clone());
+    assert_eq!(1, checks.load(Ordering::SeqCst));
+
+    TUNER.clear();
+    let _ = TUNER.execute(&id, &client, test_set, handles);
+    assert_eq!(2, checks.load(Ordering::SeqCst));
 }
