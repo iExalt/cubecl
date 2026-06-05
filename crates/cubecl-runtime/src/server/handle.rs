@@ -85,6 +85,11 @@ impl Handle {
         self.memory.can_mut()
     }
 
+    /// Returns whether both handles share the same managed allocation.
+    pub fn is_alias_of(&self, other: &Self) -> bool {
+        self.memory.is_alias_of(&other.memory)
+    }
+
     /// Returns the [`BufferBinding`] corresponding to the current handle.
     pub fn binding(self) -> BufferBinding {
         BufferBinding {
