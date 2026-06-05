@@ -132,7 +132,7 @@ where
         for i in 0..operations.len() {
             let op = operations.fastest(i);
             let result = op.execute(I::clone_for_check(inputs));
-            checks_outputs.push(result);
+            checks_outputs.push((i, op.name.clone(), result));
         }
         super::check_autotune_outputs(checks_outputs);
 

@@ -405,13 +405,28 @@ fn log_result<K: AutotuneKey>(
 
 #[cfg(feature = "autotune-checks")]
 pub(crate) fn check_autotune_outputs<O: AutotuneOutput>(
-    mut checks_outputs: Vec<Result<O, AutotuneError>>,
+    mut checks_outputs: Vec<(usize, String, Result<O, AutotuneError>)>,
 ) {
-    let reference = checks_outputs.remove(checks_outputs.len() - 1);
+    let (reference_index, reference_name, reference) =
+        checks_outputs.remove(checks_outputs.len() - 1);
 
     if let Ok(reference) = reference {
-        for other in checks_outputs.into_iter().flatten() {
-            reference.check_equivalence(other);
+        for (index, name, other) in checks_outputs {
+            if let Ok(other) = other {
+                #[cfg(feature = "std")]
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    reference.check_equivalence(other)
+                }))
+                .is_err()
+                {
+                    panic!(
+                        "Autotune candidate {index} '{name}' failed correctness check against reference {reference_index} '{reference_name}'"
+                    );
+                }
+
+                #[cfg(not(feature = "std"))]
+                reference.check_equivalence(other);
+            }
         }
     }
 }

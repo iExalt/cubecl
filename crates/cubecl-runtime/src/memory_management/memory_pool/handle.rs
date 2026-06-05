@@ -166,6 +166,11 @@ impl ManagedMemoryHandle {
         Arc::strong_count(&self.handle_count) <= 2
     }
 
+    /// Return whether both handles alias the same managed memory.
+    pub fn is_alias_of(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.handle_count, &other.handle_count)
+    }
+
     /// Return whether the current handle is free.
     pub fn is_free(&self) -> bool {
         Arc::strong_count(&self.descriptor) <= 1
@@ -265,5 +270,15 @@ mod tests {
 
         handle.descriptor().update_slice(42);
         assert_eq!(handle2.descriptor().slice(), 42);
+    }
+
+    #[test]
+    fn test_is_alias_of() {
+        let handle = ManagedMemoryHandle::new();
+        let alias = handle.clone();
+        let independent = ManagedMemoryHandle::new();
+
+        assert!(handle.is_alias_of(&alias));
+        assert!(!handle.is_alias_of(&independent));
     }
 }

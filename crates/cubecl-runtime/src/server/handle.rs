@@ -70,6 +70,11 @@ impl Handle {
         self.memory.can_mut()
     }
 
+    /// Returns whether both handles alias the same managed memory.
+    pub fn is_alias_of(&self, other: &Self) -> bool {
+        self.memory.is_alias_of(&other.memory)
+    }
+
     /// Returns the [`Binding`] corresponding to the current handle.
     pub fn binding(self) -> Binding {
         Binding {
