@@ -251,6 +251,7 @@ impl<K: AutotuneKey> TuneCache<K> {
         let Some(seed_cache) = self.seed_cache.take() else {
             return;
         };
+        let loaded = seed_cache.len() as u64;
         for (key, (checksum, fastest_index)) in seed_cache {
             self.in_memory_cache.insert(
                 key,
@@ -260,6 +261,7 @@ impl<K: AutotuneKey> TuneCache<K> {
                 },
             );
         }
+        crate::cache_metrics::record_autotune_seed_entries_loaded(loaded);
     }
 
     pub fn fastest(&self, key: &K) -> TuneCacheResult {
@@ -394,6 +396,7 @@ impl<K: AutotuneKey> TuneCache<K> {
             );
         });
         self.hydrated = complete;
+        crate::cache_metrics::record_autotune_writable_entries_loaded(delivered);
 
         delivered
     }
@@ -428,6 +431,8 @@ impl<K: AutotuneKey> TuneCache<K> {
                     "Autotune result for key {key:?} could not be stored, it will be retuned: {error}"
                 ),
             }
+        } else {
+            crate::cache_metrics::record_autotune_write();
         }
     }
 }

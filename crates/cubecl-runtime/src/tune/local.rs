@@ -202,6 +202,7 @@ where
         // `fastest` also resets the tuner cache if the environment switched, so
         // a miss here falls through to `check_tune`, which re-hydrates.
         if let TuneCacheResult::Hit { fastest_index } = tuner.fastest(&key) {
+            crate::cache_metrics::record_autotune_hit();
             #[cfg(feature = "autotune-checks")]
             log_context.set_checks_results(self.checks_once::<I, Out>(
                 id,

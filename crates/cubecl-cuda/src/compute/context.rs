@@ -29,6 +29,7 @@ use std::ffi::CString;
 use std::ffi::c_char;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use std::{ffi::CStr, os::raw::c_void};
 
 use cubecl_server::compiler::{CompilationCache, compilation_store, store_compiled};
@@ -130,6 +131,7 @@ impl CudaContext {
 
             if let Some(entry) = cache.remove(&key) {
                 log::trace!("Using PTX cache");
+                cubecl_runtime::cache_metrics::record_compilation_cache_hit();
 
                 self.load_ptx(
                     entry.ptx,
@@ -141,6 +143,7 @@ impl CudaContext {
                 )?;
                 return Ok(Ok(()));
             }
+            cubecl_runtime::cache_metrics::record_compilation_cache_miss();
             Some(key)
         } else {
             None
@@ -221,6 +224,7 @@ impl CudaContext {
 
         logger.log_compilation(&kernel_compiled);
 
+        let nvrtc_start = Instant::now();
         // SAFETY: Calling NVRTC FFI to create, compile, and extract PTX from a program.
         // The `CString` source is null-terminated and outlives the program. On compilation
         // failure, the error log is retrieved and reported before returning.
@@ -261,6 +265,7 @@ impl CudaContext {
                 backtrace: BackTrace::capture(),
             })?
         };
+        cubecl_runtime::cache_metrics::record_nvrtc_compilation(nvrtc_start.elapsed());
 
         let io = kernel_compiled.io.take();
         // A precompiled kernel has no representation to read the size from:
@@ -284,6 +289,7 @@ impl CudaContext {
                     io: io.clone(),
                 },
             );
+            cubecl_runtime::cache_metrics::record_compilation_cache_write();
             store_compiled(second_line_cache, cpp_hash.unwrap(), key);
         }
 
@@ -308,6 +314,7 @@ impl CudaContext {
         io: Option<Arc<[BufferIOAttr]>>,
     ) -> Result<(), CompilationError> {
         let func_name = CString::new(entrypoint_name).unwrap();
+        let module_load_start = Instant::now();
         // SAFETY: `ptx` is a valid null-terminated PTX binary from NVRTC. `func_name` is a
         // null-terminated `CString` matching the kernel entry point in the compiled module.
         let func = unsafe {
@@ -324,6 +331,7 @@ impl CudaContext {
                 }
             })?
         };
+        cubecl_runtime::cache_metrics::record_module_load(module_load_start.elapsed());
 
         self.modules.insert(
             kernel_id.clone(),
