@@ -306,7 +306,7 @@ impl DeviceService for CudaServer {
         register_mma_features(supported_mma_combinations, &mut device_props);
         register_scaled_mma_features(supported_scaled_mma_combinations, &mut device_props);
 
-        let cuda_ctx = CudaContext::new(comp_opts, device_props.clone(), ctx, arch);
+        let cuda_ctx = CudaContext::new(comp_opts, device_props.clone(), ctx, arch, device_ptr);
         let logger = Arc::new(ServerLogger::default());
         let policy = PitchedMemoryLayoutPolicy::new(device_props.memory.alignment as usize);
         let utilities = ServerUtilities::new(device_props, logger, (), policy);

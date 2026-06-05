@@ -36,6 +36,9 @@ pub mod storage;
 /// `CubeCL` config module.
 pub mod config;
 
+/// Process-wide cache metrics for startup observability.
+pub mod cache_metrics;
+
 pub use cubecl_common::benchmark;
 
 /// Logging utilities to be used by a compute server.

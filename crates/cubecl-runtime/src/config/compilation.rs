@@ -1,6 +1,8 @@
 #[cfg(std_io)]
 use super::cache::CacheConfig;
 use super::logger::{LogLevel, LoggerConfig};
+#[cfg(std_io)]
+use alloc::string::String;
 
 /// Configuration for compilation settings in `CubeCL`.
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -12,6 +14,10 @@ pub struct CompilationConfig {
     #[serde(default)]
     #[cfg(std_io)]
     pub cache: Option<CacheConfig>,
+    /// Caller-provided namespace for invalidating compiled kernels after backend or codegen changes.
+    #[serde(default)]
+    #[cfg(std_io)]
+    pub cache_namespace: Option<String>,
     /// Controls whether kernel launches enforce bounds checks.
     #[serde(default)]
     pub check_mode: BoundsCheckMode,

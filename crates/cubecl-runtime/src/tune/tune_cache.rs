@@ -265,6 +265,7 @@ impl<K: AutotuneKey> TuneCache<K> {
                 }
             }
         }
+        crate::cache_metrics::record_autotune_write();
         // .expect();
     }
 
@@ -295,6 +296,8 @@ impl<K: AutotuneKey> TuneCache<K> {
                 },
             );
         });
+        crate::cache_metrics::record_autotune_seed_entries_loaded(seeded);
+        crate::cache_metrics::record_autotune_writable_entries_loaded(writable);
         log::info!("Loaded {seeded} seeded and {writable} writable autotune cached entries");
     }
 }

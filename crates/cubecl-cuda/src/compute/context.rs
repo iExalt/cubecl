@@ -28,6 +28,7 @@ use std::ffi::CString;
 use std::ffi::c_char;
 use std::str::FromStr;
 use std::sync::{Arc, Once};
+use std::time::Instant;
 use std::{ffi::CStr, os::raw::c_void};
 
 use cubecl_common::cache::CacheOption;
@@ -36,7 +37,8 @@ use cubecl_common::cache::CacheOption;
 pub(crate) struct CudaContext {
     pub context: *mut CUctx_st,
     pub module_names: HashMap<KernelId, CompiledKernel>,
-    ptx_cache: Option<CompilationCache<StableHash, PtxCacheEntry>>,
+    ptx_cache: Option<CompilationCache<PtxCacheKey, PtxCacheEntry>>,
+    ptx_cache_fingerprint: String,
     pub timestamps: TimestampProfiler,
     pub arch: CudaArchitecture,
     pub compilation_options: CompilationOptions,
@@ -90,14 +92,22 @@ pub struct PtxCacheEntry {
     ptx: Vec<std::ffi::c_char>,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone, Hash)]
+struct PtxCacheKey {
+    fingerprint: String,
+    kernel: StableHash,
+}
+
 impl CudaContext {
     pub fn new(
         compilation_options: CompilationOptions,
         properties: DeviceProperties,
         context: *mut CUctx_st,
         arch: CudaArchitecture,
+        device: cudarc::driver::sys::CUdevice,
     ) -> Self {
         initialize_nvrtc_shutdown();
+        let ptx_cache_fingerprint = ptx_cache_fingerprint(&compilation_options, &arch, device);
         Self {
             context,
             module_names: HashMap::new(),
@@ -108,12 +118,16 @@ impl CudaContext {
                     let root = cache.root();
                     Some(CompilationCache::new(
                         "ptx",
-                        CacheOption::default().name("cuda").root(root),
+                        CacheOption::default()
+                            .name("cuda")
+                            .version(format!("{}-strict-ptx-v1", env!("CARGO_PKG_VERSION")))
+                            .root(root),
                     ))
                 } else {
                     None
                 }
             },
+            ptx_cache_fingerprint,
             arch,
             timestamps: TimestampProfiler::default(),
             compilation_options,
@@ -135,11 +149,15 @@ impl CudaContext {
         mode: ExecutionMode,
         logger: Arc<ServerLogger>,
     ) -> Result<(), LaunchError> {
-        let hash = if let Some(cache) = &self.ptx_cache {
-            let hash = kernel_id.stable_hash();
+        let cache_key = if let Some(cache) = &self.ptx_cache {
+            let cache_key = PtxCacheKey {
+                fingerprint: self.ptx_cache_fingerprint.clone(),
+                kernel: kernel_id.stable_hash(),
+            };
 
-            if let Some(entry) = cache.get(&hash) {
+            if let Some(entry) = cache.get(&cache_key) {
                 log::trace!("Using PTX cache");
+                cubecl_runtime::cache_metrics::record_compilation_cache_hit();
 
                 self.load_ptx(
                     entry.ptx.clone(),
@@ -150,7 +168,8 @@ impl CudaContext {
                 )?;
                 return Ok(());
             }
-            Some(hash)
+            cubecl_runtime::cache_metrics::record_compilation_cache_miss();
+            Some(cache_key)
         } else {
             None
         };
@@ -198,6 +217,7 @@ impl CudaContext {
         // SAFETY: Calling NVRTC FFI to create, compile, and extract PTX from a program.
         // The `CString` source is null-terminated and outlives the program. On compilation
         // failure, the error log is retrieved and reported before returning.
+        let nvrtc_start = Instant::now();
         let ptx = unsafe {
             // I'd like to set the name to the kernel name, but keep getting UTF-8 errors so let's
             // leave it `None` for now
@@ -245,12 +265,13 @@ impl CudaContext {
                 backtrace: BackTrace::capture(),
             })?
         };
+        cubecl_runtime::cache_metrics::record_nvrtc_compilation(nvrtc_start.elapsed());
 
         let repr = kernel_compiled.repr.unwrap();
 
         if let Some(cache) = &mut self.ptx_cache {
             let result = cache.insert(
-                hash.unwrap(),
+                cache_key.unwrap(),
                 PtxCacheEntry {
                     entrypoint_name: kernel_compiled.entrypoint_name.clone(),
                     shared_mem_bytes: repr.shared_memory_size(),
@@ -259,6 +280,8 @@ impl CudaContext {
             );
             if let Err(err) = result {
                 log::warn!("Unable to save the ptx {err:?}");
+            } else {
+                cubecl_runtime::cache_metrics::record_compilation_cache_write();
             }
         }
 
@@ -281,6 +304,7 @@ impl CudaContext {
         shared_mem_bytes: usize,
     ) -> Result<(), CompilationError> {
         let func_name = CString::new(entrypoint_name).unwrap();
+        let module_load_start = Instant::now();
         // SAFETY: `ptx` is a valid null-terminated PTX binary from NVRTC. `func_name` is a
         // null-terminated `CString` matching the kernel entry point in the compiled module.
         let func = unsafe {
@@ -297,6 +321,7 @@ impl CudaContext {
                 }
             })?
         };
+        cubecl_runtime::cache_metrics::record_module_load(module_load_start.elapsed());
 
         self.module_names.insert(
             kernel_id.clone(),
@@ -376,5 +401,65 @@ impl CudaContext {
         } else {
             Ok(())
         }
+    }
+}
+
+fn ptx_cache_fingerprint(
+    compilation_options: &CompilationOptions,
+    arch: &CudaArchitecture,
+    device: cudarc::driver::sys::CUdevice,
+) -> String {
+    use cubecl_runtime::config::RuntimeConfig;
+
+    let config = cubecl_runtime::config::CubeClRuntimeConfig::get();
+    let namespace = config
+        .compilation
+        .cache_namespace
+        .as_deref()
+        .unwrap_or(concat!("cubecl-cuda-", env!("CARGO_PKG_VERSION")));
+    let device_name =
+        cudarc::driver::result::device::get_name(device).unwrap_or_else(|_| "unknown".to_string());
+    let device_uuid = cudarc::driver::result::device::get_uuid(device)
+        .map(|uuid| {
+            uuid.bytes
+                .iter()
+                .map(|byte| format!("{:02x}", *byte as u8))
+                .collect::<String>()
+        })
+        .unwrap_or_else(|_| "unknown".to_string());
+    let driver_version = cuda_driver_version();
+    let nvrtc_version = nvrtc_version();
+
+    format!(
+        "schema=1;namespace={namespace};cuda_header={};driver={driver_version};nvrtc={nvrtc_version};arch={arch:?};device_name={device_name};device_uuid={device_uuid};options={compilation_options:?};check_mode={:?}",
+        cudarc::driver::sys::CUDA_VERSION,
+        config.compilation.check_mode,
+    )
+}
+
+fn cuda_driver_version() -> i32 {
+    let mut version = 0;
+    // SAFETY: `cuDriverGetVersion` writes one integer to the provided live pointer.
+    if unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut version) }
+        .result()
+        .is_ok()
+    {
+        version
+    } else {
+        0
+    }
+}
+
+fn nvrtc_version() -> String {
+    let mut major = 0;
+    let mut minor = 0;
+    // SAFETY: `nvrtcVersion` writes two integers to the provided live pointers.
+    if unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) }
+        .result()
+        .is_ok()
+    {
+        format!("{major}.{minor}")
+    } else {
+        "unknown".to_string()
     }
 }

@@ -161,8 +161,13 @@ impl<K: AutotuneKey> Tuner<K> {
             };
 
             match cur {
-                TuneCacheResult::Hit { .. } | TuneCacheResult::Pending => return cur,
+                TuneCacheResult::Hit { .. } => {
+                    crate::cache_metrics::record_autotune_hit();
+                    return cur;
+                }
+                TuneCacheResult::Pending => return cur,
                 TuneCacheResult::Miss | TuneCacheResult::Unchecked => {
+                    crate::cache_metrics::record_autotune_miss();
                     cache.mark_pending(key.clone())
                 }
             }

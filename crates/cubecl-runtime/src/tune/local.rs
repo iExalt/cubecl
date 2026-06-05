@@ -177,6 +177,7 @@ where
 
         // First, check for a cache hit under a read lock.
         if let TuneCacheResult::Hit { fastest_index } = tuner.fastest(&key) {
+            crate::cache_metrics::record_autotune_hit();
             #[cfg(feature = "autotune-checks")]
             self.checks_once::<I, Out>(id, &key, &operations, &inputs);
             return operations
