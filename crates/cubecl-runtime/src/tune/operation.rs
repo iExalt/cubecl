@@ -39,6 +39,7 @@ impl<I: TuneInputs, Out: 'static> TuneFn<I, Out> {
 /// input generator. See [`TuneInputs`] for the `F` parameter.
 pub struct TunableSet<K: AutotuneKey, F: TuneInputs, Output: 'static> {
     tunables: Vec<Tunable<K, F, Output>>,
+    reference_index: Option<usize>,
     key_gen: Arc<dyn KeyGenerator<K, F> + Send + Sync>,
     input_gen: Arc<dyn InputGenerator<K, F> + Send + Sync>,
 }
@@ -58,6 +59,7 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
     pub fn new(key_gen: impl KeyGenerator<K, F>, input_gen: impl InputGenerator<K, F>) -> Self {
         Self {
             tunables: Default::default(),
+            reference_index: None,
             input_gen: Arc::new(input_gen),
             key_gen: Arc::new(key_gen),
         }
@@ -73,6 +75,38 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
     pub fn with(mut self, tunable: Tunable<K, F, Output>) -> Self {
         self.tunables.push(tunable);
         self
+    }
+
+    /// Register the trusted correctness reference used by checked autotune.
+    ///
+    /// When no reference is declared, checked autotune preserves the legacy behavior of using the
+    /// final registered candidate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a reference candidate was already registered.
+    pub fn with_reference(mut self, tunable: Tunable<K, F, Output>) -> Self {
+        assert!(
+            self.reference_index.is_none(),
+            "Only one autotune reference can be registered"
+        );
+        self.reference_index = Some(self.tunables.len());
+        self.tunables.push(tunable);
+        self
+    }
+
+    /// Returns the candidate index used as the checked-autotune correctness reference.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the set contains no candidates.
+    #[cfg_attr(not(feature = "autotune-checks"), allow(dead_code))]
+    pub(crate) fn reference_index(&self) -> usize {
+        self.reference_index.unwrap_or_else(|| {
+            self.len()
+                .checked_sub(1)
+                .expect("Autotune requires a candidate")
+        })
     }
 
     /// All candidate operations in this set, in registration order.
@@ -136,3 +170,51 @@ pub trait AutotuneKey:
 }
 
 impl AutotuneKey for String {}
+
+#[cfg(test)]
+mod tests {
+    use super::{Tunable, TunableSet};
+    use std::string::String;
+
+    fn tunable(name: &str) -> Tunable<String, usize, usize> {
+        Tunable::new(name, Ok::<usize, String>)
+    }
+
+    #[test]
+    fn test_reference_index() {
+        struct TestCase {
+            set: TunableSet<String, usize, usize>,
+        }
+
+        struct ExpectedTestResult {
+            reference_index: usize,
+        }
+
+        let test_cases = [
+            TestCase {
+                set: TunableSet::new_cloning_inputs(|_: &usize| String::new())
+                    .with(tunable("first"))
+                    .with(tunable("last")),
+            },
+            TestCase {
+                set: TunableSet::new_cloning_inputs(|_: &usize| String::new())
+                    .with_reference(tunable("reference"))
+                    .with(tunable("last")),
+            },
+        ];
+        let expected_results = [
+            ExpectedTestResult { reference_index: 1 },
+            ExpectedTestResult { reference_index: 0 },
+        ];
+
+        for (index, (test_case, expected)) in
+            test_cases.iter().zip(expected_results.iter()).enumerate()
+        {
+            assert_eq!(
+                expected.reference_index,
+                test_case.set.reference_index(),
+                "Test case {index} failed",
+            );
+        }
+    }
+}

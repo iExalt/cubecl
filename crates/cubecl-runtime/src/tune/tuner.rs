@@ -404,11 +404,18 @@ fn log_result<K: AutotuneKey>(
 }
 
 #[cfg(feature = "autotune-checks")]
-pub(crate) fn check_autotune_outputs<O: AutotuneOutput>(
+pub(crate) fn check_autotune_outputs<K: AutotuneKey, O: AutotuneOutput>(
+    tuner_name: &str,
+    device_id: &impl core::fmt::Display,
+    key: &K,
+    reference_index: usize,
     mut checks_outputs: Vec<(usize, String, Result<O, AutotuneError>)>,
 ) {
-    let (reference_index, reference_name, reference) =
-        checks_outputs.remove(checks_outputs.len() - 1);
+    let reference_position = checks_outputs
+        .iter()
+        .position(|(index, _, _)| *index == reference_index)
+        .expect("Autotune reference index should identify a candidate output");
+    let (reference_index, reference_name, reference) = checks_outputs.remove(reference_position);
 
     if let Ok(reference) = reference {
         for (index, name, other) in checks_outputs {
@@ -420,7 +427,7 @@ pub(crate) fn check_autotune_outputs<O: AutotuneOutput>(
                 .is_err()
                 {
                     panic!(
-                        "Autotune candidate {index} '{name}' failed correctness check against reference {reference_index} '{reference_name}'"
+                        "Autotune candidate {index} '{name}' failed correctness check against reference {reference_index} '{reference_name}' for tuner '{tuner_name}', device '{device_id}', and key '{key}'"
                     );
                 }
 

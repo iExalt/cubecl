@@ -83,6 +83,8 @@ impl PartialEq for AutotuneResult {
 pub(crate) struct TuneCache<K> {
     in_memory_cache: HashMap<K, CacheEntry>,
     #[cfg(std_io)]
+    seed_cache: Option<Cache<PersistentCacheKey<K>, PersistentCacheValue>>,
+    #[cfg(std_io)]
     persistent_cache: Cache<PersistentCacheKey<K>, PersistentCacheValue>,
 }
 
@@ -112,22 +114,15 @@ impl<K: AutotuneKey> TuneCache<K> {
         #[cfg(std_io)]
         {
             use crate::config::RuntimeConfig;
-            use std::format;
 
-            let root = crate::config::CubeClRuntimeConfig::get()
+            let config = crate::config::CubeClRuntimeConfig::get();
+            let root = config.autotune.cache.root();
+            let seed_root = config
                 .autotune
-                .cache
-                .root();
-            let options = cubecl_common::cache::CacheOption::default();
-            let mut cache = TuneCache {
-                in_memory_cache: HashMap::new(),
-                persistent_cache: Cache::new(
-                    format!("{device_id}/{name}"),
-                    options.root(root).name("autotune"),
-                ),
-            };
-            cache.load();
-            cache
+                .seed_cache
+                .as_ref()
+                .map(|cache| cache.root());
+            Self::new_with_roots(name, device_id, root, seed_root)
         }
 
         #[cfg(not(std_io))]
@@ -136,6 +131,33 @@ impl<K: AutotuneKey> TuneCache<K> {
                 in_memory_cache: HashMap::new(),
             }
         }
+    }
+
+    #[cfg(std_io)]
+    fn new_with_roots(
+        name: &str,
+        device_id: &str,
+        root: std::path::PathBuf,
+        seed_root: Option<std::path::PathBuf>,
+    ) -> Self {
+        use std::format;
+
+        let options = cubecl_common::cache::CacheOption::default();
+        let mut cache = TuneCache {
+            in_memory_cache: HashMap::new(),
+            seed_cache: seed_root.map(|root| {
+                Cache::new(
+                    format!("{device_id}/{name}"),
+                    options.clone().root(root).name("autotune"),
+                )
+            }),
+            persistent_cache: Cache::new(
+                format!("{device_id}/{name}"),
+                options.root(root).name("autotune"),
+            ),
+        };
+        cache.load();
+        cache
     }
 
     pub fn fastest(&self, key: &K) -> TuneCacheResult {
@@ -248,10 +270,23 @@ impl<K: AutotuneKey> TuneCache<K> {
 
     /// Load the persistent cache data from disk
     pub(crate) fn load(&mut self) {
-        log::info!("Load autotune cache ...");
-        let mut loaded = 0;
+        let mut seeded = 0;
+        if let Some(seed_cache) = self.seed_cache.as_mut() {
+            seed_cache.for_each(|key, value| {
+                seeded += 1;
+                self.in_memory_cache.insert(
+                    key.key.clone(),
+                    CacheEntry::Done {
+                        checksum: ChecksumState::ToBeVerified(key.checksum.clone()),
+                        fastest_index: value.fastest_index,
+                    },
+                );
+            });
+        }
+
+        let mut writable = 0;
         self.persistent_cache.for_each(|key, value| {
-            loaded += 1;
+            writable += 1;
             self.in_memory_cache.insert(
                 key.key.clone(),
                 CacheEntry::Done {
@@ -260,6 +295,107 @@ impl<K: AutotuneKey> TuneCache<K> {
                 },
             );
         });
-        log::info!("Loaded {loaded} autotune cached entries");
+        log::info!("Loaded {seeded} seeded and {writable} writable autotune cached entries");
+    }
+}
+
+#[cfg(all(test, std_io))]
+mod tests {
+    use super::{
+        AutotuneResult, PersistentCacheKey, PersistentCacheValue, TuneCache, TuneCacheResult,
+    };
+    use cubecl_common::cache::{Cache, CacheOption};
+    use std::borrow::ToOwned;
+    use std::format;
+    use std::fs::remove_dir_all;
+    use std::path::{Path, PathBuf};
+    use std::string::String;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::vec::Vec;
+
+    fn temp_root(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time should be after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cubecl-tune-cache-{label}-{}-{suffix}",
+            std::process::id()
+        ))
+    }
+
+    fn persistent_cache(root: &Path) -> Cache<PersistentCacheKey<String>, PersistentCacheValue> {
+        Cache::new(
+            "device/test",
+            CacheOption::default().root(root).name("autotune"),
+        )
+    }
+
+    fn insert(
+        cache: &mut Cache<PersistentCacheKey<String>, PersistentCacheValue>,
+        key: &str,
+        checksum: &str,
+        fastest_index: usize,
+    ) {
+        cache
+            .insert(
+                PersistentCacheKey {
+                    key: key.to_owned(),
+                    checksum: checksum.to_owned(),
+                },
+                PersistentCacheValue {
+                    fastest_index,
+                    results: Vec::new(),
+                },
+            )
+            .expect("Cache insert should succeed");
+    }
+
+    #[test]
+    fn test_tune_cache_seed_overlay() {
+        let seed_root = temp_root("seed");
+        let writable_root = temp_root("writable");
+        let mut seed = persistent_cache(&seed_root);
+        insert(&mut seed, "seed-only", "seed-checksum", 1);
+        insert(&mut seed, "overlap", "seed-overlap-checksum", 2);
+        let mut writable = persistent_cache(&writable_root);
+        insert(&mut writable, "overlap", "writable-overlap-checksum", 3);
+
+        let mut cache = TuneCache::<String>::new_with_roots(
+            "test",
+            "device",
+            writable_root.clone(),
+            Some(seed_root.clone()),
+        );
+
+        assert!(matches!(
+            cache.validate_checksum(&"seed-only".to_owned(), "seed-checksum"),
+            TuneCacheResult::Hit { fastest_index: 1 },
+        ));
+        assert!(matches!(
+            cache.validate_checksum(&"overlap".to_owned(), "writable-overlap-checksum"),
+            TuneCacheResult::Hit { fastest_index: 3 },
+        ));
+
+        cache.persistent_cache_insert(
+            "new".to_owned(),
+            "new-checksum".to_owned(),
+            4,
+            Vec::<AutotuneResult>::new(),
+        );
+        let seed = persistent_cache(&seed_root);
+        let writable = persistent_cache(&writable_root);
+        let new_key = PersistentCacheKey {
+            key: "new".to_owned(),
+            checksum: "new-checksum".to_owned(),
+        };
+        assert!(seed.get(&new_key).is_none());
+        assert_eq!(
+            writable.get(&new_key).map(|value| value.fastest_index),
+            Some(4)
+        );
+
+        remove_dir_all(seed_root).ok();
+        remove_dir_all(writable_root).ok();
     }
 }

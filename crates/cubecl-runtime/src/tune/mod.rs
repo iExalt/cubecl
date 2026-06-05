@@ -27,7 +27,9 @@
 //! HRTB bound is spelled out directly (closure inference).
 //!
 //! With the `autotune-checks` feature enabled, every candidate is compared once per local tuner
-//! key. Calling [`LocalTuner::clear`] resets the checked-key state so those comparisons run again.
+//! key against the candidate registered with [`TunableSet::with_reference`]. Sets without an
+//! explicit reference preserve the legacy behavior of using the final candidate. Calling
+//! [`LocalTuner::clear`] resets the checked-key state so those comparisons run again.
 
 mod base;
 mod input_generator;

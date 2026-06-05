@@ -134,7 +134,13 @@ where
             let result = op.execute(I::clone_for_check(inputs));
             checks_outputs.push((i, op.name.clone(), result));
         }
-        super::check_autotune_outputs(checks_outputs);
+        super::check_autotune_outputs(
+            self.name,
+            id,
+            key,
+            operations.reference_index(),
+            checks_outputs,
+        );
 
         self.checked_keys
             .lock()

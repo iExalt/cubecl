@@ -17,6 +17,14 @@ pub struct AutotuneConfig {
     #[serde(default)]
     #[cfg(std_io)]
     pub cache: CacheConfig,
+
+    /// Optional read-only seed cache loaded before the writable cache.
+    ///
+    /// Entries still pass the normal per-operation candidate checksum validation. Cache misses and
+    /// newly tuned results are written only to [`Self::cache`].
+    #[serde(default)]
+    #[cfg(std_io)]
+    pub seed_cache: Option<CacheConfig>,
 }
 
 /// Log levels for autotune logging in `CubeCL`.
