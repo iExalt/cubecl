@@ -80,6 +80,8 @@ pub trait AutotuneLoggerExt {
     fn set_limit(&mut self, limit: Option<Duration>);
     /// Sets checks if logging is active.
     fn set_checks(&mut self, checks: impl FnOnce() -> Vec<CheckResult>);
+    /// Attaches already executed checks if logging or recording is active.
+    fn set_checks_results(&mut self, checks: Vec<CheckResult>);
     /// Logs the benchmark result if logging is enabled.
     fn log_result<K: AutotuneKey>(&self, logger: &mut Logger, key: &K, results: &[AutotuneResult]);
 }
@@ -119,6 +121,12 @@ macro_rules! impl_autotune_logger_ext {
             fn set_checks(&mut self, checks: impl FnOnce() -> Vec<CheckResult>) {
                 if let Some(ctx) = self.$as_mut() {
                     ctx.checks = Some(checks());
+                }
+            }
+
+            fn set_checks_results(&mut self, checks: Vec<CheckResult>) {
+                if let Some(ctx) = self.$as_mut() {
+                    ctx.checks = Some(checks);
                 }
             }
 

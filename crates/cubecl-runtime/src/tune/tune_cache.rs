@@ -112,6 +112,9 @@ pub(crate) struct TuneCache<K> {
     /// [`Self::in_memory_cache`] once hydrated, not here.
     #[cfg(autotune_persistence)]
     persistent_cache: Option<Store<PersistentCacheKey<K>, PersistentCacheValue>>,
+    /// Legacy JSON entries loaded read-only, when configured. The active store wins.
+    #[cfg(std_io)]
+    seed_cache: Option<HashMap<K, (String, usize)>>,
     /// Whether everything the store holds has been ingested into
     /// [`Self::in_memory_cache`]. What makes an ordinary miss cost a bool
     /// check rather than a walk; `false` while an asynchronous storage
@@ -158,6 +161,8 @@ impl<K: AutotuneKey> TuneCache<K> {
                 return TuneCache {
                     in_memory_cache: HashMap::new(),
                     persistent_cache: None,
+                    #[cfg(std_io)]
+                    seed_cache: None,
                     hydrated: true,
                     generation: cubecl_environment::environment::generation(),
                 };
@@ -175,10 +180,13 @@ impl<K: AutotuneKey> TuneCache<K> {
                         .storage(namespace)
                         .cache(CacheOption::Lazy),
                 )),
+                #[cfg(std_io)]
+                seed_cache: Self::load_seed(name, device_id),
                 hydrated: false,
                 generation,
             };
             log::info!("Load autotune cache ...");
+            cache.load_seed_into_memory();
             let loaded = cache.sync_persistent();
             log::info!("Loaded {loaded} autotune cached entries");
 
@@ -190,6 +198,67 @@ impl<K: AutotuneKey> TuneCache<K> {
             TuneCache {
                 in_memory_cache: HashMap::new(),
             }
+        }
+    }
+
+    #[cfg(std_io)]
+    fn load_seed(name: &str, device_id: &str) -> Option<HashMap<K, (String, usize)>> {
+        use serde::Deserialize;
+
+        let root = crate::config::CubeClRuntimeConfig::get()
+            .autotune
+            .seed_cache
+            .as_ref()?
+            .root();
+        let mut file = root.join("autotune").join(env!("CARGO_PKG_VERSION"));
+        for segment in [device_id, name] {
+            let safe = segment
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            file.push(safe);
+        }
+        file.set_extension("json.log");
+        let bytes = std::fs::read(file).ok()?;
+        #[derive(Deserialize)]
+        struct Entry<K> {
+            key: PersistentCacheKey<K>,
+            value: PersistentCacheValue,
+        }
+        let mut entries = HashMap::new();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_slice::<Entry<K>>(line) {
+                entries.insert(
+                    entry.key.key,
+                    (entry.key.checksum, entry.value.fastest_index),
+                );
+            }
+        }
+        Some(entries)
+    }
+
+    #[cfg(std_io)]
+    fn load_seed_into_memory(&mut self) {
+        let Some(seed_cache) = self.seed_cache.take() else {
+            return;
+        };
+        for (key, (checksum, fastest_index)) in seed_cache {
+            self.in_memory_cache.insert(
+                key,
+                CacheEntry::Done {
+                    checksum: ChecksumState::ToBeVerified(checksum),
+                    fastest_index,
+                },
+            );
         }
     }
 
@@ -316,12 +385,13 @@ impl<K: AutotuneKey> TuneCache<K> {
         let mut delivered = 0;
         let complete = persistent_cache.scan(|key, value| {
             delivered += 1;
-            self.in_memory_cache
-                .entry(key.key)
-                .or_insert(CacheEntry::Done {
+            self.in_memory_cache.insert(
+                key.key,
+                CacheEntry::Done {
                     checksum: ChecksumState::ToBeVerified(key.checksum),
                     fastest_index: value.fastest_index,
-                });
+                },
+            );
         });
         self.hydrated = complete;
 

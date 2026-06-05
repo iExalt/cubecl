@@ -674,8 +674,12 @@ async fn process_request<K: AutotuneKey>(
 }
 
 #[cfg(feature = "autotune-checks")]
-pub(crate) fn check_autotune_outputs<O: AutotuneOutput>(
-    mut checks_outputs: Vec<(String, Result<O, AutotuneError>)>,
+pub(crate) fn check_autotune_outputs<K: AutotuneKey, O: AutotuneOutput>(
+    tuner_name: &str,
+    device_id: &impl core::fmt::Display,
+    key: &K,
+    reference_index: usize,
+    mut checks_outputs: Vec<(usize, String, Result<O, AutotuneError>)>,
 ) -> Vec<crate::tune::log::CheckResult> {
     if checks_outputs.is_empty() {
         return Vec::new();
@@ -683,18 +687,22 @@ pub(crate) fn check_autotune_outputs<O: AutotuneOutput>(
 
     let reference_idx = checks_outputs
         .iter()
-        .position(|(_, res)| res.is_ok())
-        .unwrap_or(checks_outputs.len() - 1);
+        .position(|(index, _, _)| *index == reference_index)
+        .expect("Autotune reference index should identify a candidate output");
     let reference = checks_outputs.remove(reference_idx);
-    let reference_result = reference.1;
+    let reference_result = reference.2;
     #[cfg(std_io)]
-    let reference_name = reference.0;
+    let reference_name = reference.1;
 
     let is_recording = is_recording_enabled();
 
     #[cfg(std_io)]
     {
         let reference_passed = reference_result.is_ok();
+        let checks_outputs = checks_outputs
+            .into_iter()
+            .map(|(_, name, result)| (name, result))
+            .collect();
         let mut check_results = execute_checks(checks_outputs, reference_result, is_recording);
         check_results.push(crate::tune::log::CheckResult {
             name: reference_name,
@@ -706,6 +714,10 @@ pub(crate) fn check_autotune_outputs<O: AutotuneOutput>(
 
     #[cfg(not(std_io))]
     {
+        let checks_outputs = checks_outputs
+            .into_iter()
+            .map(|(_, name, result)| (name, result))
+            .collect();
         execute_checks(checks_outputs, reference_result, is_recording)
     }
 }

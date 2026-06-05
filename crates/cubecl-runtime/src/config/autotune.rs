@@ -26,6 +26,14 @@ pub struct AutotuneConfig {
     #[serde(default)]
     pub disable_cache: bool,
 
+    /// Optional read-only seed cache from the legacy JSON cache layout.
+    ///
+    /// Entries are validated against the current candidate checksum and new or retuned entries are
+    /// written only to the active environment store.
+    #[serde(default)]
+    #[cfg(std_io)]
+    pub seed_cache: Option<crate::config::cache::CacheConfig>,
+
     /// Whether to disable the short circuit logic during autotuning.
     #[serde(default)]
     pub disable_short_circuit: bool,

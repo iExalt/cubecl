@@ -152,9 +152,15 @@ where
         for i in 0..operations.len() {
             let op = operations.fastest(i);
             let result = op.execute(I::clone_for_check(inputs));
-            checks_outputs.push((op.name.to_string(), result));
+            checks_outputs.push((i, op.name.to_string(), result));
         }
-        let checks = super::check_autotune_outputs(checks_outputs);
+        let checks = super::check_autotune_outputs(
+            self.name,
+            id,
+            key,
+            operations.reference_index(),
+            checks_outputs,
+        );
         self.checked_keys
             .lock()
             .get_or_insert_with(HashSet::new)
@@ -192,18 +198,28 @@ where
         #[allow(unused_mut)]
         let mut log_context = crate::tune::AutotuneLogContext::new(&mut tuner.logger().lock());
 
-        #[cfg(feature = "autotune-checks")]
-        log_context.set_checks(|| self.checks_once::<I, Out>(id, &key, &operations, &inputs));
-
         // Fast path: a cached hit skips straight to the fastest operation.
         // `fastest` also resets the tuner cache if the environment switched, so
         // a miss here falls through to `check_tune`, which re-hydrates.
         if let TuneCacheResult::Hit { fastest_index } = tuner.fastest(&key) {
+            #[cfg(feature = "autotune-checks")]
+            log_context.set_checks_results(self.checks_once::<I, Out>(
+                id,
+                &key,
+                &operations,
+                &inputs,
+            ));
             return operations
                 .fastest(fastest_index)
                 .execute(inputs)
                 .expect("Should run when selected by autotune.");
         }
+
+        // Correctness checks are independent of whether a human logger or recorder is enabled.
+        // Compute them before handing the optional context to `check_tune`, which consumes it;
+        // the context receives the already evaluated results when one exists.
+        #[cfg(feature = "autotune-checks")]
+        log_context.set_checks_results(self.checks_once::<I, Out>(id, &key, &operations, &inputs));
 
         let fastest = tuner.check_tune::<I, Out>(
             &key,
