@@ -1,10 +1,8 @@
 use cubecl_common::backtrace::BackTrace;
-use cubecl_common::stream_id::StreamId;
 use cubecl_cpp::formatter::format_cpp;
 use cubecl_cpp::{cuda::arch::CudaArchitecture, shared::CompilationOptions};
 use cubecl_runtime::{
     compiler::CompilationError,
-    server::Handle,
     validation::{validate_cube_dim, validate_units},
 };
 
@@ -39,7 +37,6 @@ use cubecl_common::cache::CacheOption;
 pub(crate) struct CudaContext {
     pub context: *mut CUctx_st,
     pub module_names: HashMap<KernelId, CompiledKernel>,
-    pub dynamic_metadata_cache: HashMap<StreamId, HashMap<Vec<u8>, Handle>>,
     ptx_cache: Option<CompilationCache<PtxCacheKey, PtxCacheEntry>>,
     ptx_cache_fingerprint: String,
     pub timestamps: TimestampProfiler,
@@ -114,7 +111,6 @@ impl CudaContext {
         Self {
             context,
             module_names: HashMap::new(),
-            dynamic_metadata_cache: HashMap::new(),
             ptx_cache: {
                 use cubecl_runtime::config::RuntimeConfig;
                 let config = cubecl_runtime::config::CubeClRuntimeConfig::get();

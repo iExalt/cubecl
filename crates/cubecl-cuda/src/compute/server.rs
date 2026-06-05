@@ -689,7 +689,7 @@ impl CudaServer {
             let mut handle = Option::None;
             if info.dynamic_metadata_offset < info.data.len() {
                 let dyn_meta = &bytemuck::cast_slice(&info.data[info.dynamic_metadata_offset..]);
-                handle = Some(command.create_with_cached_metadata(dyn_meta, stream_id)?);
+                handle = Some(command.create_with_data(dyn_meta)?);
             }
 
             (Some(info.data.as_ptr() as *mut c_void), handle)
