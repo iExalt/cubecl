@@ -43,6 +43,35 @@ pub struct Command<'a> {
 }
 
 impl<'a> Command<'a> {
+    /// Reuses an identical dynamic metadata upload on the same CUDA stream.
+    pub fn create_with_cached_metadata(
+        &mut self,
+        data: &[u8],
+        stream_id: StreamId,
+    ) -> Result<Handle, IoError> {
+        if let Some(handle) = self
+            .ctx
+            .dynamic_metadata_cache
+            .get(&stream_id)
+            .and_then(|cache| cache.get(data))
+            .cloned()
+        {
+            return Ok(handle);
+        }
+
+        let handle = self.create_with_data(data)?;
+        let cache = self
+            .ctx
+            .dynamic_metadata_cache
+            .entry(stream_id)
+            .or_default();
+        if cache.len() >= 4_096 {
+            cache.clear();
+        }
+        cache.insert(data.to_vec(), handle.clone());
+        Ok(handle)
+    }
+
     /// Retrieves a GPU resource associated with the provided binding.
     ///
     /// # Parameters
