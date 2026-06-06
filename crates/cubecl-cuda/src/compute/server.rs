@@ -178,6 +178,7 @@ impl Server for CudaServer {
         stream_id: StreamId,
         launch_mode: LaunchMode,
     ) {
+        cubecl_runtime::op_metrics::record_kernel_launch();
         let kernel_id = kernel.id();
         if self.compile_failed(&kernel_id, kernel, &bindings, stream_id, launch_mode) {
             return;
@@ -338,6 +339,7 @@ impl Server for CudaServer {
         handles: Vec<BufferBinding>,
         stream_id: StreamId,
     ) -> DynFut<Result<(), ServerError>> {
+        cubecl_runtime::op_metrics::record_synchronization();
         // The claim check a read would have made, without the read; claims
         // are set at enqueue time, so they are already in place. A fault the
         // barrier itself reveals comes back through the fence below.

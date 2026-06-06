@@ -83,6 +83,7 @@ impl Driver for Cuda {
         bytes: &mut Bytes,
         stream: &Stream,
     ) -> Result<(), IoError> {
+        cubecl_runtime::op_metrics::record_d2h_copy(bytes.len() as u64);
         let Some(pitch) = layout.pitch else {
             // SAFETY: the source is contiguous, so one linear copy of exactly
             // the bytes the destination was sized for.
@@ -125,6 +126,7 @@ impl Driver for Cuda {
         data: &[u8],
         stream: &Stream,
     ) -> Result<(), IoError> {
+        cubecl_runtime::op_metrics::record_h2d_copy(data.len() as u64);
         let Some(pitch) = layout.pitch else {
             // The one write the taint bookkeeping cannot record: an oversized
             // copy corrupts whatever pool slice sits past the target, memory
