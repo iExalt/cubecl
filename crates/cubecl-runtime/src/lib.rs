@@ -39,6 +39,9 @@ pub mod config;
 /// Process-wide cache metrics for startup observability.
 pub mod cache_metrics;
 
+/// Process-wide GPU operation counts for deterministic workload observability.
+pub mod op_metrics;
+
 pub use cubecl_common::benchmark;
 
 /// Logging utilities to be used by a compute server.

@@ -449,6 +449,7 @@ impl<'a> Command<'a> {
     ///
     /// * A `DynFut<()>` future that resolves when the stream is synchronized.
     pub fn sync(&mut self) -> DynFut<Result<(), ServerError>> {
+        cubecl_runtime::op_metrics::record_synchronization();
         let fence = Fence::new(self.streams.current().sys);
 
         Box::pin(async { fence.wait_sync() })
@@ -533,6 +534,7 @@ pub(crate) unsafe fn write_to_gpu(
     dst_ptr: u64,
     stream: *mut CUstream_st,
 ) -> Result<(), IoError> {
+    cubecl_runtime::op_metrics::record_h2d_copy(data.len() as u64);
     #[cfg(debug_assertions)]
     try_check_pitched_row_major_strides(shape, strides).map_err(|e| IoError::Unknown {
         description: format!("write_to_gpu: invalid strides: {e}"),
@@ -626,6 +628,7 @@ pub(crate) unsafe fn write_to_cpu(
 
     let rank = shape.len();
     let bytes = bytes.deref_mut();
+    cubecl_runtime::op_metrics::record_d2h_copy(bytes.len() as u64);
     if rank <= 1 {
         // SAFETY: For rank <= 1 data is contiguous. `resource_ptr` is a valid device pointer
         // and `bytes` has sufficient capacity.

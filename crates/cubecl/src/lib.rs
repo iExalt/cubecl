@@ -3,6 +3,7 @@ pub use cubecl_core::*;
 pub use cubecl_ir::features;
 pub use cubecl_runtime::cache_metrics;
 pub use cubecl_runtime::config;
+pub use cubecl_runtime::op_metrics;
 pub use cubecl_runtime::memory_management::MemoryAllocationMode;
 
 #[cfg(feature = "wgpu")]
