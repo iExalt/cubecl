@@ -449,7 +449,6 @@ impl<'a> Command<'a> {
     ///
     /// * A `DynFut<()>` future that resolves when the stream is synchronized.
     pub fn sync(&mut self) -> DynFut<Result<(), ServerError>> {
-        cubecl_runtime::op_metrics::record_synchronization();
         let fence = Fence::new(self.streams.current().sys);
 
         Box::pin(async { fence.wait_sync() })

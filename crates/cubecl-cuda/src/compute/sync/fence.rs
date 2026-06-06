@@ -42,6 +42,7 @@ impl Fence {
     /// Wait for the [Fence] to be reached, ensuring that all previous tasks enqueued to the
     /// [stream](CUstream_st) are completed.
     pub fn wait_sync(self) -> Result<(), ServerError> {
+        cubecl_runtime::op_metrics::record_synchronization();
         // SAFETY: `self.event` is a valid event created in `Fence::new`. We synchronize
         // (block) until the event completes, then destroy it. `self` is consumed so the
         // event cannot be double-freed.
