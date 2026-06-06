@@ -64,6 +64,7 @@ impl EventApi for Cuda {
     }
 
     fn event_wait(event: &Self::Event) -> Result<(), DriverError> {
+        cubecl_runtime::op_metrics::record_synchronization();
         // SAFETY: the event is live for as long as `event`.
         named("cuEventSynchronize", unsafe { event::synchronize(event.0) })
     }

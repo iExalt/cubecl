@@ -339,7 +339,6 @@ impl Server for CudaServer {
         handles: Vec<BufferBinding>,
         stream_id: StreamId,
     ) -> DynFut<Result<(), ServerError>> {
-        cubecl_runtime::op_metrics::record_synchronization();
         // The claim check a read would have made, without the read; claims
         // are set at enqueue time, so they are already in place. A fault the
         // barrier itself reveals comes back through the fence below.
