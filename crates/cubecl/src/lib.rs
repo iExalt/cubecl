@@ -23,8 +23,10 @@ pub use cubecl_core::*;
 pub use cubecl_ir::features;
 pub use cubecl_runtime::cache_metrics;
 pub use cubecl_runtime::config;
-pub use cubecl_runtime::op_metrics;
+#[cfg(feature = "std")]
+pub use cubecl_runtime::lifecycle;
 pub use cubecl_runtime::memory_management::MemoryAllocationMode;
+pub use cubecl_runtime::op_metrics;
 
 /// Ship pre-warmed autotune and compilation caches with an application.
 ///

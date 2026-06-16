@@ -35,6 +35,7 @@ use cubecl_server::{
     storage::{ComputeStorage, ManagedResource},
     stream::{ExecuteScope, FailureStore, MultiStream, StreamCapture, WriteScoped, failed_writing},
 };
+use cudarc::driver::DriverError;
 use cudarc::driver::sys::{
     CUstream_st, CUtensorMap, CUtensorMapDataType, CUtensorMapFloatOOBfill, CUtensorMapInterleave,
     CUtensorMapL2promotion, CUtensorMapSwizzle, cuTensorMapEncodeIm2col, cuTensorMapEncodeTiled,
@@ -554,6 +555,12 @@ impl WriteScoped for CudaServer {
 }
 
 impl CudaServer {
+    /// Waits for all work submitted to the CUDA context.
+    pub(crate) fn shutdown(&mut self) -> Result<(), DriverError> {
+        self.ctx.unsafe_set_current()?;
+        cudarc::driver::result::ctx::synchronize()
+    }
+
     /// Create a new cuda server.
     pub(crate) fn new(
         ctx: CudaContext,

@@ -56,6 +56,8 @@ pub trait DeviceService: Send + 'static {
         Self: Sized;
     /// Get the service utilities.
     fn utilities(&self) -> ServerUtilitiesHandle;
+    /// Quiesces backend work before the device runner drops the service.
+    fn shutdown(&mut self) {}
     /// Which pipeline stage this service runs on.
     ///
     /// Services on [`DeviceServiceStage::Upstream`] produce work ahead of time (e.g. autodiff graph

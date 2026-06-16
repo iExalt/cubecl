@@ -41,7 +41,9 @@ impl OpMetrics {
             h2d_bytes: self.h2d_bytes.saturating_sub(earlier.h2d_bytes),
             d2h_copies: self.d2h_copies.saturating_sub(earlier.d2h_copies),
             d2h_bytes: self.d2h_bytes.saturating_sub(earlier.d2h_bytes),
-            synchronizations: self.synchronizations.saturating_sub(earlier.synchronizations),
+            synchronizations: self
+                .synchronizations
+                .saturating_sub(earlier.synchronizations),
         }
     }
 }

@@ -219,7 +219,7 @@ std::thread_local! {
 
     /// Heterogeneous map of service states owned by this thread.
     #[allow(clippy::type_complexity)]
-    static STATES: RefCell<HashMap<TypeId, RefCell<Box<dyn Any + 'static>>>> = RefCell::new(HashMap::new());
+    static STATES: RefCell<HashMap<TypeId, ServiceState>> = RefCell::new(HashMap::new());
 }
 
 /// Internal runner logic to manage background thread spawning.
@@ -240,6 +240,31 @@ struct ChannelDeviceState {
 struct ChannelService {
     type_id: TypeId,
     utilities: ServerUtilitiesHandle,
+}
+
+struct ServiceState {
+    service: RefCell<Box<dyn Any + 'static>>,
+    shutdown: fn(&mut Box<dyn Any + 'static>),
+}
+
+impl ServiceState {
+    fn new<S: DeviceService>(service: S) -> Self {
+        fn shutdown<S: DeviceService>(service: &mut Box<dyn Any + 'static>) {
+            service
+                .downcast_mut::<S>()
+                .expect("State type mismatch in Thread Local Storage")
+                .shutdown();
+        }
+
+        Self {
+            service: RefCell::new(Box::new(service)),
+            shutdown: shutdown::<S>,
+        }
+    }
+
+    fn shutdown(&mut self) {
+        (self.shutdown)(self.service.get_mut());
+    }
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
@@ -385,7 +410,7 @@ impl ChannelDeviceState {
                     let utilities = service.utilities();
 
                     map.entry(type_id)
-                        .or_insert_with(|| RefCell::new(Box::new(service)));
+                        .or_insert_with(|| ServiceState::new(service));
                     callback
                         .send(Ok(ChannelService { type_id, utilities }))
                         .unwrap();
@@ -437,8 +462,9 @@ impl ChannelService {
     /// Panics if the state is already borrowed (re-entrant access).
     fn act_on<R>(&self, f: impl FnOnce(&mut Box<dyn Any + 'static>) -> R) -> R {
         STATES.with_borrow(|map| {
-            let cell = map.get(&self.type_id).expect("Service state not found");
-            let mut guard = cell
+            let state = map.get(&self.type_id).expect("Service state not found");
+            let mut guard = state
+                .service
                 .try_borrow_mut()
                 .expect("Service state is already borrowed");
             f(&mut guard)
@@ -451,10 +477,21 @@ impl DeviceRunner {
     /// client together with the thread's join handle.
     pub fn start(runner_id: RunnerId) -> RunnerEntry {
         let (sender_init, recv_init) = oneshot::channel();
-        let (client, thread) = DeviceClient::new(runner_id, move || {
-            SERVER_THREAD.with_borrow_mut(|cell| *cell = Some(runner_id));
-            sender_init.send(()).unwrap();
-        });
+        let (client, thread) = DeviceClient::new(
+            runner_id,
+            move || {
+                SERVER_THREAD.with_borrow_mut(|cell| *cell = Some(runner_id));
+                sender_init.send(()).unwrap();
+            },
+            || {
+                STATES.with_borrow_mut(|states| {
+                    for state in states.values_mut() {
+                        state.shutdown();
+                    }
+                    states.clear();
+                });
+            },
+        );
 
         if recv_init.recv().is_err() {
             panic!("Failed to synchronize device runner thread initialization");
@@ -759,10 +796,15 @@ mod normal_channel {
             &self.runner_id
         }
         /// Creates a new channel and spawns a server thread to process it.
-        pub fn new<I: FnOnce() + Send + 'static>(
+        pub fn new<I, S>(
             runner_id: RunnerId,
             init: I,
-        ) -> (Self, std::thread::JoinHandle<()>) {
+            shutdown: S,
+        ) -> (Self, std::thread::JoinHandle<()>)
+        where
+            I: FnOnce() + Send + 'static,
+            S: FnOnce() + Send + 'static,
+        {
             let (sender, recv) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send + 'static>>(
                 CHANNEL_MAX_TASK,
             );
@@ -887,6 +929,7 @@ mod custom_channel {
                 .spawn(move || {
                     init();
                     server.start();
+                    shutdown();
                 })
                 .unwrap();
 
