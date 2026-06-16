@@ -11,6 +11,7 @@ use std::{
     boxed::Box,
     cell::RefCell,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::Once,
     vec::Vec,
 };
 
@@ -247,6 +248,12 @@ struct ServiceState {
     shutdown: fn(&mut Box<dyn Any + 'static>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunnerShutdownMode {
+    Explicit,
+    ProcessExit,
+}
+
 impl ServiceState {
     fn new<S: DeviceService>(service: S) -> Self {
         fn shutdown<S: DeviceService>(service: &mut Box<dyn Any + 'static>) {
@@ -264,6 +271,18 @@ impl ServiceState {
 
     fn shutdown(&mut self) {
         (self.shutdown)(self.service.get_mut());
+    }
+}
+
+fn shutdown_service_states(states: &mut HashMap<TypeId, ServiceState>, mode: RunnerShutdownMode) {
+    match mode {
+        RunnerShutdownMode::Explicit => {
+            for state in states.values_mut() {
+                state.shutdown();
+            }
+            states.clear();
+        }
+        RunnerShutdownMode::ProcessExit => core::mem::forget(core::mem::take(states)),
     }
 }
 
@@ -483,12 +502,9 @@ impl DeviceRunner {
                 SERVER_THREAD.with_borrow_mut(|cell| *cell = Some(runner_id));
                 sender_init.send(()).unwrap();
             },
-            || {
+            |mode| {
                 STATES.with_borrow_mut(|states| {
-                    for state in states.values_mut() {
-                        state.shutdown();
-                    }
-                    states.clear();
+                    shutdown_service_states(states, mode);
                 });
             },
         );
@@ -521,7 +537,68 @@ impl DeviceRunner {
 /// warning rather than blocking forever. That bounds the failure modes the ownership
 /// rules cannot rule out: a task holding this device's handle parked in *another*
 /// device's unflushed queue, or two runners shutting each other down.
+pub(crate) fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
+    shutdown_device_services_with_mode(RunnerShutdownMode::Explicit)
+}
+
+fn shutdown_device_services_with_mode(
+    mode: RunnerShutdownMode,
+) -> Result<(), DeviceServicesShutdownError> {
+    let device_ids = CHANNELS
+        .lock()
+        .as_ref()
+        .into_iter()
+        .flat_map(|registry| registry.channels.keys().map(|(runner, _)| runner.device))
+        .chain(
+            RUNNERS
+                .lock()
+                .as_ref()
+                .into_iter()
+                .flat_map(|runners| runners.keys().map(|runner| runner.device)),
+        )
+        .collect::<HashSet<_>>();
+    for device_id in device_ids {
+        shutdown_device_with_mode(device_id, mode);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn atexit(callback: extern "C" fn()) -> core::ffi::c_int;
+}
+
+#[cfg(unix)]
+extern "C" fn shutdown_device_services_at_exit() {
+    let _ = catch_unwind(|| shutdown_device_services_with_mode(RunnerShutdownMode::ProcessExit));
+}
+
+pub(crate) fn register_shutdown_hook() {
+    #[cfg(unix)]
+    {
+        static REGISTERED: Once = Once::new();
+        REGISTERED.call_once(|| {
+            // SAFETY: callback has C ABI, takes no arguments and is process-lifetime valid.
+            let result = unsafe { atexit(shutdown_device_services_at_exit) };
+            assert_eq!(result, 0, "Failed to register device-service shutdown hook");
+        });
+    }
+}
+
+pub(crate) fn register_backend_shutdown_hook() {
+    #[cfg(unix)]
+    {
+        // Keep a separate registration for dynamically loaded backend teardown ordering.
+        // The callback itself is idempotent because the registries are swept on first call.
+        let _ = catch_unwind(|| unsafe { atexit(shutdown_device_services_at_exit) });
+    }
+}
+
 pub(crate) fn shutdown_device(device_id: DeviceId) {
+    shutdown_device_with_mode(device_id, RunnerShutdownMode::Explicit);
+}
+
+fn shutdown_device_with_mode(device_id: DeviceId, mode: RunnerShutdownMode) {
     // A runner joining itself would deadlock. Cycles through another device cannot be
     // caught here, the join timeout is what bounds those.
     SERVER_THREAD.with_borrow(|current| {
@@ -569,6 +646,9 @@ pub(crate) fn shutdown_device(device_id: DeviceId) {
     drop(channels);
 
     for (runner_id, runner) in runners {
+        if mode == RunnerShutdownMode::ProcessExit {
+            runner.client.process_exit();
+        }
         runner.client.request_shutdown();
         drop(runner.client);
         join_runner(runner_id, runner.thread);
@@ -909,12 +989,18 @@ mod custom_channel {
             &self.state.runner_id
         }
         /// Creates a new channel and spawns a server thread to process it.
-        pub fn new<I: FnOnce() + Send + 'static>(
+        pub fn new<I, S>(
             runner_id: RunnerId,
             init: I,
-        ) -> (Self, std::thread::JoinHandle<()>) {
+            shutdown: S,
+        ) -> (Self, std::thread::JoinHandle<()>)
+        where
+            I: FnOnce() + Send + 'static,
+            S: FnOnce(RunnerShutdownMode) + Send + 'static,
+        {
             let mut server = Server::new(runner_id);
             let state = server.state.clone();
+            let shutdown_state = state.clone();
 
             let thread = std::thread::Builder::new()
                 .name(std::format!(
@@ -929,7 +1015,12 @@ mod custom_channel {
                 .spawn(move || {
                     init();
                     server.start();
-                    shutdown();
+                    let mode = if shutdown_state.process_exit.load(Ordering::Acquire) {
+                        RunnerShutdownMode::ProcessExit
+                    } else {
+                        RunnerShutdownMode::Explicit
+                    };
+                    shutdown(mode);
                 })
                 .unwrap();
 
@@ -941,6 +1032,10 @@ mod custom_channel {
         /// server keeps draining until the last one is gone.
         pub fn request_shutdown(&self) {
             self.state.shutdown.store(true, Ordering::Release);
+        }
+
+        fn process_exit(&self) {
+            self.state.process_exit.store(true, Ordering::Release);
         }
 
         /// Atomically reserves a slot in the buffer and writes the task.
@@ -986,6 +1081,8 @@ mod custom_channel {
         /// Set by [`DeviceClient::request_shutdown`]; the server winds down
         /// once it is set and every client is dropped.
         shutdown: AtomicBool,
+        /// Whether service state must be leaked instead of finalized at process exit.
+        process_exit: AtomicBool,
         /// The runner id (for debugging purposes).
         runner_id: RunnerId,
     }
@@ -1079,6 +1176,7 @@ mod custom_channel {
                 available_index: AtomicU32::new(0),
                 enqueued_count: AtomicU32::new(0),
                 shutdown: AtomicBool::new(false),
+                process_exit: AtomicBool::new(false),
                 runner_id,
             });
 
