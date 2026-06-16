@@ -1,7 +1,7 @@
 use crate::{
     device::{
         DeviceId, DeviceService, DeviceServiceStage, ServerUtilitiesHandle,
-        handle::{CallError, DeviceHandleSpec, ServiceCreationError},
+        handle::{CallError, DeviceHandleSpec, DeviceServicesShutdownError, ServiceCreationError},
     },
     stream_id::StreamId,
 };
@@ -12,6 +12,7 @@ use std::{
     cell::RefCell,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Condvar, LazyLock, Mutex, Once},
     vec::Vec,
 };
 
@@ -209,7 +210,7 @@ std::thread_local! {
 
     /// Heterogeneous map of service states owned by this thread.
     #[allow(clippy::type_complexity)]
-    static STATES: RefCell<HashMap<TypeId, RefCell<Box<dyn Any + 'static>>>> = RefCell::new(HashMap::new());
+    static STATES: RefCell<HashMap<TypeId, ServiceState>> = RefCell::new(HashMap::new());
 }
 
 /// Internal runner logic to manage background thread spawning.
@@ -232,6 +233,31 @@ struct ChannelService {
     utilities: ServerUtilitiesHandle,
 }
 
+struct ServiceState {
+    service: RefCell<Box<dyn Any + 'static>>,
+    shutdown: fn(&mut Box<dyn Any + 'static>),
+}
+
+impl ServiceState {
+    fn new<S: DeviceService>(service: S) -> Self {
+        fn shutdown<S: DeviceService>(service: &mut Box<dyn Any + 'static>) {
+            service
+                .downcast_mut::<S>()
+                .expect("State type mismatch in Thread Local Storage")
+                .shutdown();
+        }
+
+        Self {
+            service: RefCell::new(Box::new(service)),
+            shutdown: shutdown::<S>,
+        }
+    }
+
+    fn shutdown(&mut self) {
+        (self.shutdown)(self.service.get_mut());
+    }
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 struct RunnerId {
     device: DeviceId,
@@ -245,12 +271,71 @@ static RUNNERS: spin::Mutex<Option<HashMap<RunnerId, DeviceClient>>> = spin::Mut
 static CHANNELS: spin::Mutex<Option<HashMap<(RunnerId, TypeId), ChannelDeviceState>>> =
     spin::Mutex::new(None);
 
+#[derive(Default)]
+struct LifecycleState {
+    active_initializers: usize,
+    shutting_down: bool,
+}
+
+static LIFECYCLE: LazyLock<(Mutex<LifecycleState>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(LifecycleState::default()), Condvar::new()));
+
+struct InitializationPermit;
+
+impl InitializationPermit {
+    fn acquire() -> Self {
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        while lifecycle.shutting_down {
+            lifecycle = condition.wait(lifecycle).unwrap();
+        }
+        lifecycle.active_initializers += 1;
+        Self
+    }
+}
+
+impl Drop for InitializationPermit {
+    fn drop(&mut self) {
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        lifecycle.active_initializers -= 1;
+        condition.notify_all();
+    }
+}
+
+struct ShutdownPermit;
+
+impl ShutdownPermit {
+    fn acquire() -> Self {
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        while lifecycle.shutting_down {
+            lifecycle = condition.wait(lifecycle).unwrap();
+        }
+        lifecycle.shutting_down = true;
+        while lifecycle.active_initializers != 0 {
+            lifecycle = condition.wait(lifecycle).unwrap();
+        }
+        Self
+    }
+}
+
+impl Drop for ShutdownPermit {
+    fn drop(&mut self) {
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        lifecycle.shutting_down = false;
+        condition.notify_all();
+    }
+}
+
 /// Stops and joins every device runner.
 ///
 /// New submissions must stop before this function is called. Runners are shut
 /// down upstream-first so queued producer work is cancelled before downstream
 /// services are dropped.
-pub fn shutdown_device_services() {
+pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
+    let _permit = ShutdownPermit::acquire();
     let channels = CHANNELS.lock().take();
 
     let mut runners = RUNNERS
@@ -261,11 +346,20 @@ pub fn shutdown_device_services() {
         .collect::<Vec<_>>();
     runners.sort_by_key(|(runner_id, _)| runner_id.stage as u8);
 
+    let mut runner_panics = 0;
     for (_, runner) in runners {
-        runner.shutdown();
+        if runner.shutdown().is_err() {
+            runner_panics += 1;
+        }
     }
 
     core::mem::drop(channels);
+
+    if runner_panics == 0 {
+        Ok(())
+    } else {
+        Err(DeviceServicesShutdownError::new(runner_panics))
+    }
 }
 
 #[cfg(unix)]
@@ -275,27 +369,44 @@ unsafe extern "C" {
 
 #[cfg(unix)]
 extern "C" fn shutdown_device_services_at_exit() {
-    if catch_unwind(shutdown_device_services).is_err() {
-        log::warn!("Device-service shutdown hook failed");
+    match catch_unwind(shutdown_device_services) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => log::warn!("Device-service shutdown hook failed: {err}"),
+        Err(_) => log::warn!("Device-service shutdown hook panicked"),
     }
 }
 
 #[cfg(unix)]
-pub fn register_shutdown_hook() {
+fn register_shutdown_hook_raw() {
     // SAFETY: The callback has C ABI, takes no arguments, and remains valid
     // for the lifetime of the process.
     let result = unsafe { atexit(shutdown_device_services_at_exit) };
     assert_eq!(result, 0, "Failed to register device-service shutdown hook");
 }
 
+#[cfg(unix)]
+pub fn register_shutdown_hook() {
+    static REGISTERED: Once = Once::new();
+    REGISTERED.call_once(register_shutdown_hook_raw);
+}
+
+#[cfg(unix)]
+pub fn register_backend_shutdown_hook() {
+    register_shutdown_hook_raw();
+}
+
 #[cfg(not(unix))]
 pub fn register_shutdown_hook() {}
+
+#[cfg(not(unix))]
+pub fn register_backend_shutdown_hook() {}
 
 impl ChannelDeviceState {
     pub fn init<S: DeviceService>(
         device_id: DeviceId,
         service: Option<S>,
     ) -> Result<Self, ServiceCreationError> {
+        let _permit = InitializationPermit::acquire();
         let type_id = TypeId::of::<S>();
         let runner_id = RunnerId {
             device: device_id,
@@ -350,7 +461,7 @@ impl ChannelDeviceState {
                     let utilities = service.utilities();
 
                     map.entry(type_id)
-                        .or_insert_with(|| RefCell::new(Box::new(service)));
+                        .or_insert_with(|| ServiceState::new(service));
                     callback
                         .send(Ok(ChannelService { type_id, utilities }))
                         .unwrap();
@@ -403,8 +514,9 @@ impl ChannelService {
     /// Panics if the state is already borrowed (re-entrant access).
     fn act_on<R>(&self, f: impl FnOnce(&mut Box<dyn Any + 'static>) -> R) -> R {
         STATES.with_borrow(|map| {
-            let cell = map.get(&self.type_id).expect("Service state not found");
-            let mut guard = cell
+            let state = map.get(&self.type_id).expect("Service state not found");
+            let mut guard = state
+                .service
                 .try_borrow_mut()
                 .expect("Service state is already borrowed");
             f(&mut guard)
@@ -416,10 +528,21 @@ impl DeviceRunner {
     /// Spawns a new thread, marks it with the `device_id`, and returns a `DeviceClient`.
     pub fn start(runner_id: RunnerId) -> DeviceClient {
         let (sender_init, recv_init) = oneshot::channel();
-        let channel = DeviceClient::new(runner_id, move || {
-            SERVER_THREAD.with_borrow_mut(|cell| *cell = Some(runner_id));
-            sender_init.send(()).unwrap();
-        });
+        let channel = DeviceClient::new(
+            runner_id,
+            move || {
+                SERVER_THREAD.with_borrow_mut(|cell| *cell = Some(runner_id));
+                sender_init.send(()).unwrap();
+            },
+            || {
+                STATES.with_borrow_mut(|states| {
+                    for state in states.values_mut() {
+                        state.shutdown();
+                    }
+                    states.clear();
+                });
+            },
+        );
 
         if recv_init.recv().is_err() {
             panic!("Failed to synchronize device runner thread initialization");
@@ -711,7 +834,11 @@ mod custom_channel {
             &self.state.runner_id
         }
         /// Creates a new channel and spawns a server thread to process it.
-        pub fn new<I: FnOnce() + Send + 'static>(runner_id: RunnerId, init: I) -> Self {
+        pub fn new<I, S>(runner_id: RunnerId, init: I, shutdown: S) -> Self
+        where
+            I: FnOnce() + Send + 'static,
+            S: FnOnce() + Send + 'static,
+        {
             let mut server = Server::new(runner_id);
             let state = server.state.clone();
 
@@ -728,6 +855,7 @@ mod custom_channel {
                 .spawn(move || {
                     init();
                     server.start();
+                    shutdown();
                 })
                 .unwrap();
 
@@ -807,7 +935,7 @@ mod custom_channel {
         }
 
         /// Stops accepting work, cancels queued tasks, and joins the runner.
-        pub fn shutdown(&self) {
+        pub fn shutdown(&self) -> Result<(), ()> {
             if self.state.accepting.swap(false, Ordering::AcqRel) {
                 while self.state.active_enqueues.load(Ordering::Acquire) != 0 {
                     std::thread::yield_now();
@@ -816,11 +944,11 @@ mod custom_channel {
                 self.state.shutdown_requested.store(true, Ordering::Release);
             }
 
-            if let Some(join_handle) = self.join_handle.lock().unwrap().take()
-                && join_handle.join().is_err()
-            {
-                log::warn!("Device runner thread failed during shutdown");
+            if let Some(join_handle) = self.join_handle.lock().unwrap().take() {
+                join_handle.join().map_err(|_| ())?;
             }
+
+            Ok(())
         }
     }
 
@@ -981,6 +1109,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     // A mock service to track state changes and initialization
@@ -997,6 +1126,59 @@ mod tests {
         fn utilities(&self) -> ServerUtilitiesHandle {
             Arc::new(())
         }
+    }
+
+    #[test]
+    fn test_shutdown_waits_for_active_task_and_runs_service_shutdown() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 100,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (task_started_tx, task_started_rx) = mpsc::channel();
+        let (task_release_tx, task_release_rx) = mpsc::channel();
+        let (service_shutdown_tx, service_shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || service_shutdown_tx.send(()).unwrap(),
+        );
+
+        client
+            .enqueue(move || {
+                task_started_tx.send(()).unwrap();
+                task_release_rx.recv().unwrap();
+            })
+            .unwrap();
+        client.flush();
+        task_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
+
+        let (runner_shutdown_tx, runner_shutdown_rx) = mpsc::channel();
+        let shutdown_client = client.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_client.shutdown().unwrap();
+            runner_shutdown_tx.send(()).unwrap();
+        });
+
+        assert!(
+            runner_shutdown_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "shutdown must wait for the active task"
+        );
+
+        task_release_tx.send(()).unwrap();
+        runner_shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runner should finish after the active task");
+        service_shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("service shutdown should run before the runner exits");
+        shutdown_thread.join().unwrap();
     }
 
     #[test]

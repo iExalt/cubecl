@@ -324,6 +324,12 @@ impl DeviceService for CudaServer {
     fn utilities(&self) -> ServerUtilitiesHandle {
         self.utilities() as ServerUtilitiesHandle
     }
+
+    fn shutdown(&mut self) {
+        if let Err(err) = self.shutdown() {
+            log::warn!("Unable to synchronize CUDA during shutdown: {err}");
+        }
+    }
 }
 
 pub type CudaCompiler = CppCompiler<CudaDialect<WmmaCompiler>>;

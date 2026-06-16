@@ -80,7 +80,7 @@ fn initialize_nvrtc_shutdown() {
             );
             cudarc::nvrtc::result::compile_program(program.0, &[] as &[&str])
                 .expect("NVRTC shutdown initialization should compile");
-            cubecl_common::device_handle::register_device_services_shutdown_hook();
+            cubecl_common::device_handle::register_device_services_backend_shutdown_hook();
         }
     });
 }

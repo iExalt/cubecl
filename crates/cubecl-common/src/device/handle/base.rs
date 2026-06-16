@@ -4,6 +4,38 @@ use crate::device::{DeviceId, DeviceService, ServerUtilitiesHandle};
 #[derive(Debug)]
 pub struct CallError;
 
+/// Error returned when one or more device runners fail during shutdown.
+#[derive(Debug)]
+pub struct DeviceServicesShutdownError {
+    runner_panics: usize,
+}
+
+impl DeviceServicesShutdownError {
+    /// Creates a shutdown error for the number of runner threads that panicked.
+    #[allow(dead_code)]
+    pub(crate) fn new(runner_panics: usize) -> Self {
+        Self { runner_panics }
+    }
+
+    /// Returns the number of runner threads that panicked.
+    pub fn runner_panics(&self) -> usize {
+        self.runner_panics
+    }
+}
+
+impl core::fmt::Display for DeviceServicesShutdownError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "{} device runner thread(s) failed during shutdown",
+            self.runner_panics
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for DeviceServicesShutdownError {}
+
 #[derive(new, Clone, Debug)]
 /// Error when creating a [`DeviceService`].
 pub struct ServiceCreationError {

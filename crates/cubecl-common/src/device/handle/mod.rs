@@ -85,15 +85,25 @@ impl<S: DeviceService> DeviceHandle<S> {
 /// Stops and joins every device runner.
 ///
 /// New submissions must stop before this function is called.
-pub fn shutdown_device_services() {
+pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
     #[cfg(all(feature = "std", multi_threading))]
-    channel::shutdown_device_services();
+    return channel::shutdown_device_services();
+
+    #[cfg(not(all(feature = "std", multi_threading)))]
+    Ok(())
 }
 
 /// Registers process-exit shutdown after a dynamically loaded backend library.
 pub fn register_device_services_shutdown_hook() {
     #[cfg(all(feature = "std", multi_threading))]
     channel::register_shutdown_hook();
+}
+
+/// Registers an additional process-exit shutdown hook after loading a backend library.
+#[doc(hidden)]
+pub fn register_device_services_backend_shutdown_hook() {
+    #[cfg(all(feature = "std", multi_threading))]
+    channel::register_backend_shutdown_hook();
 }
 
 #[cfg(test)]

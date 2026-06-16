@@ -52,6 +52,9 @@ pub mod tma;
 
 /// Compiler trait and related types
 pub mod compiler;
+/// Process-wide runtime lifecycle management.
+#[cfg(feature = "std")]
+pub mod lifecycle;
 /// Runtime trait and related types
 pub mod runtime;
 /// Simple system profiling using timestamps.

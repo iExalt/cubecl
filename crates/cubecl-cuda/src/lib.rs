@@ -69,6 +69,8 @@ pub mod install {
 #[cfg(test)]
 #[allow(unexpected_cfgs)]
 mod tests {
+    use cubecl_runtime::lifecycle::RuntimeGuard;
+
     pub type TestRuntime = crate::CudaRuntime;
 
     pub use half::{bf16, f16};
@@ -78,4 +80,13 @@ mod tests {
     cubecl_std::testgen!();
     cubecl_std::testgen_tensor_identity!([f16, bf16, f32, u32]);
     cubecl_std::testgen_quantized_view!(f16);
+
+    #[test]
+    fn test_runtime_guard_shutdown() {
+        let guard = RuntimeGuard::acquire().unwrap();
+        {
+            let _client = <TestRuntime as cubecl_core::Runtime>::client(&Default::default());
+        }
+        guard.shutdown().unwrap();
+    }
 }
