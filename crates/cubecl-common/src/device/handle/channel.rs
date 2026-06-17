@@ -12,7 +12,7 @@ use std::{
     cell::RefCell,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Condvar, LazyLock, Mutex, Once},
+    sync::{Condvar, LazyLock, Mutex},
     vec::Vec,
 };
 
@@ -238,12 +238,6 @@ struct ServiceState {
     shutdown: fn(&mut Box<dyn Any + 'static>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RunnerShutdownMode {
-    Explicit,
-    ProcessExit,
-}
-
 impl ServiceState {
     fn new<S: DeviceService>(service: S) -> Self {
         fn shutdown<S: DeviceService>(service: &mut Box<dyn Any + 'static>) {
@@ -264,21 +258,11 @@ impl ServiceState {
     }
 }
 
-fn shutdown_service_states(states: &mut HashMap<TypeId, ServiceState>, mode: RunnerShutdownMode) {
-    match mode {
-        RunnerShutdownMode::Explicit => {
-            for state in states.values_mut() {
-                state.shutdown();
-            }
-            states.clear();
-        }
-        RunnerShutdownMode::ProcessExit => {
-            // Backend libraries may already be tearing down when atexit runs.
-            // Leak their state after joining the runner so no backend destructor
-            // calls into a partially unloaded driver.
-            core::mem::forget(core::mem::take(states));
-        }
+fn shutdown_service_states(states: &mut HashMap<TypeId, ServiceState>) {
+    for state in states.values_mut() {
+        state.shutdown();
     }
+    states.clear();
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
@@ -358,12 +342,6 @@ impl Drop for ShutdownPermit {
 /// down upstream-first so queued producer work is cancelled before downstream
 /// services are dropped.
 pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
-    shutdown_device_services_with_mode(RunnerShutdownMode::Explicit)
-}
-
-fn shutdown_device_services_with_mode(
-    mode: RunnerShutdownMode,
-) -> Result<(), DeviceServicesShutdownError> {
     let _permit = ShutdownPermit::acquire();
     let channels = CHANNELS.lock().take();
 
@@ -377,7 +355,7 @@ fn shutdown_device_services_with_mode(
 
     let mut runner_panics = 0;
     for (_, runner) in runners {
-        if runner.shutdown(mode).is_err() {
+        if runner.shutdown().is_err() {
             runner_panics += 1;
         }
     }
@@ -390,45 +368,6 @@ fn shutdown_device_services_with_mode(
         Err(DeviceServicesShutdownError::new(runner_panics))
     }
 }
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn atexit(callback: extern "C" fn()) -> core::ffi::c_int;
-}
-
-#[cfg(unix)]
-extern "C" fn shutdown_device_services_at_exit() {
-    match catch_unwind(|| shutdown_device_services_with_mode(RunnerShutdownMode::ProcessExit)) {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => log::warn!("Device-service shutdown hook failed: {err}"),
-        Err(_) => log::warn!("Device-service shutdown hook panicked"),
-    }
-}
-
-#[cfg(unix)]
-fn register_shutdown_hook_raw() {
-    // SAFETY: The callback has C ABI, takes no arguments, and remains valid
-    // for the lifetime of the process.
-    let result = unsafe { atexit(shutdown_device_services_at_exit) };
-    assert_eq!(result, 0, "Failed to register device-service shutdown hook");
-}
-
-#[cfg(unix)]
-pub fn register_shutdown_hook() {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(register_shutdown_hook_raw);
-}
-
-#[cfg(unix)]
-pub fn register_backend_shutdown_hook() {
-    register_shutdown_hook_raw();
-}
-
-#[cfg(not(unix))]
-pub fn register_shutdown_hook() {}
-
-#[cfg(not(unix))]
-pub fn register_backend_shutdown_hook() {}
 
 impl ChannelDeviceState {
     pub fn init<S: DeviceService>(
@@ -521,8 +460,6 @@ impl ChannelDeviceState {
                 ));
             }
         };
-        register_shutdown_hook();
-
         let channel = Self {
             client: device_client,
             service,
@@ -563,9 +500,9 @@ impl DeviceRunner {
                 SERVER_THREAD.with_borrow_mut(|cell| *cell = Some(runner_id));
                 sender_init.send(()).unwrap();
             },
-            |mode| {
+            || {
                 STATES.with_borrow_mut(|states| {
-                    shutdown_service_states(states, mode);
+                    shutdown_service_states(states);
                 });
             },
         );
@@ -796,7 +733,7 @@ mod custom_channel {
     use crate::device::handle::{
         CallError,
         channel::{
-            RunnerId, RunnerShutdownMode,
+            RunnerId,
             task::{ArenaSlot, GLOBAL_TASK_MAX_SIZE, Task},
         },
     };
@@ -863,11 +800,10 @@ mod custom_channel {
         pub fn new<I, S>(runner_id: RunnerId, init: I, shutdown: S) -> Self
         where
             I: FnOnce() + Send + 'static,
-            S: FnOnce(RunnerShutdownMode) + Send + 'static,
+            S: FnOnce() + Send + 'static,
         {
             let mut server = Server::new(runner_id);
             let state = server.state.clone();
-            let shutdown_state = state.clone();
 
             let join_handle = std::thread::Builder::new()
                 .name(std::format!(
@@ -882,12 +818,7 @@ mod custom_channel {
                 .spawn(move || {
                     init();
                     server.start();
-                    let mode = if shutdown_state.process_exit.load(Ordering::Acquire) {
-                        RunnerShutdownMode::ProcessExit
-                    } else {
-                        RunnerShutdownMode::Explicit
-                    };
-                    shutdown(mode);
+                    shutdown();
                 })
                 .unwrap();
 
@@ -967,11 +898,7 @@ mod custom_channel {
         }
 
         /// Stops accepting work, cancels queued tasks, and joins the runner.
-        pub fn shutdown(&self, mode: RunnerShutdownMode) -> Result<(), ()> {
-            if mode == RunnerShutdownMode::ProcessExit {
-                self.state.process_exit.store(true, Ordering::Release);
-            }
-
+        pub fn shutdown(&self) -> Result<(), ()> {
             if self.state.accepting.swap(false, Ordering::AcqRel) {
                 while self.state.active_enqueues.load(Ordering::Acquire) != 0 {
                     std::thread::yield_now();
@@ -985,6 +912,12 @@ mod custom_channel {
             }
 
             Ok(())
+        }
+
+        #[cfg(test)]
+        /// Returns whether the runner still accepts task submissions.
+        pub fn is_accepting(&self) -> bool {
+            self.state.accepting.load(Ordering::Acquire)
         }
     }
 
@@ -1004,8 +937,6 @@ mod custom_channel {
         active_enqueues: AtomicU32,
         /// Whether the server should stop after draining its current task buffer.
         shutdown_requested: AtomicBool,
-        /// Whether service state must be leaked instead of finalized at process exit.
-        process_exit: AtomicBool,
         /// The runner id (for debugging purposes).
         runner_id: RunnerId,
     }
@@ -1066,7 +997,6 @@ mod custom_channel {
                 accepting: AtomicBool::new(true),
                 active_enqueues: AtomicU32::new(0),
                 shutdown_requested: AtomicBool::new(false),
-                process_exit: AtomicBool::new(false),
                 runner_id,
             });
 
@@ -1168,39 +1098,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_service_states_leaks_process_exit_services() {
-        struct DropService(Arc<AtomicUsize>);
-
-        impl Drop for DropService {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        impl DeviceService for DropService {
-            fn init(_id: DeviceId) -> Self {
-                unreachable!()
-            }
-
-            fn utilities(&self) -> ServerUtilitiesHandle {
-                Arc::new(())
-            }
-        }
-
-        let drops = Arc::new(AtomicUsize::new(0));
-        let mut states = HashMap::new();
-        states.insert(
-            TypeId::of::<DropService>(),
-            ServiceState::new(DropService(drops.clone())),
-        );
-
-        shutdown_service_states(&mut states, RunnerShutdownMode::ProcessExit);
-
-        assert!(states.is_empty());
-        assert_eq!(drops.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
     fn test_shutdown_waits_for_active_task_and_runs_service_shutdown() {
         let runner_id = RunnerId {
             device: DeviceId {
@@ -1215,10 +1112,7 @@ mod tests {
         let client = custom_channel::DeviceClient::new(
             runner_id,
             || {},
-            move |mode| {
-                assert_eq!(mode, RunnerShutdownMode::Explicit);
-                service_shutdown_tx.send(()).unwrap();
-            },
+            move || service_shutdown_tx.send(()).unwrap(),
         );
 
         client
@@ -1235,9 +1129,7 @@ mod tests {
         let (runner_shutdown_tx, runner_shutdown_rx) = mpsc::channel();
         let shutdown_client = client.clone();
         let shutdown_thread = std::thread::spawn(move || {
-            shutdown_client
-                .shutdown(RunnerShutdownMode::Explicit)
-                .unwrap();
+            shutdown_client.shutdown().unwrap();
             runner_shutdown_tx.send(()).unwrap();
         });
 
@@ -1256,6 +1148,61 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("service shutdown should run before the runner exits");
         shutdown_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_shutdown_cancels_buffered_tasks_and_drops_captures() {
+        struct DropSpy(Arc<AtomicUsize>);
+
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 101,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (task_started_tx, task_started_rx) = mpsc::channel();
+        let (task_release_tx, task_release_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+
+        client
+            .enqueue(move || {
+                task_started_tx.send(()).unwrap();
+                task_release_rx.recv().unwrap();
+            })
+            .unwrap();
+        client.flush();
+        task_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
+
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let spy = DropSpy(Arc::clone(&drop_count));
+        let run_count_task = Arc::clone(&run_count);
+        client
+            .enqueue(move || {
+                let _ = &spy;
+                run_count_task.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+
+        let shutdown_client = client.clone();
+        let shutdown_thread = std::thread::spawn(move || shutdown_client.shutdown().unwrap());
+        while client.is_accepting() {
+            std::thread::yield_now();
+        }
+        task_release_tx.send(()).unwrap();
+        shutdown_thread.join().unwrap();
+
+        assert_eq!(run_count.load(Ordering::SeqCst), 0);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

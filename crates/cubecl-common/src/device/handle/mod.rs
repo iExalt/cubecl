@@ -93,19 +93,6 @@ pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
     Ok(())
 }
 
-/// Registers process-exit shutdown after a dynamically loaded backend library.
-pub fn register_device_services_shutdown_hook() {
-    #[cfg(all(feature = "std", multi_threading))]
-    channel::register_shutdown_hook();
-}
-
-/// Registers an additional process-exit shutdown hook after loading a backend library.
-#[doc(hidden)]
-pub fn register_device_services_backend_shutdown_hook() {
-    #[cfg(all(feature = "std", multi_threading))]
-    channel::register_backend_shutdown_hook();
-}
-
 #[cfg(test)]
 mod tests_channel {
     type DeviceHandle<S> = channel::ChannelDeviceHandle<S>;

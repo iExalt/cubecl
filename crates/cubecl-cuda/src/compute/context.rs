@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::c_char;
 use std::str::FromStr;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Instant;
 use std::{ffi::CStr, os::raw::c_void};
 
@@ -64,27 +64,6 @@ impl Drop for NvrtcProgram {
     }
 }
 
-fn initialize_nvrtc_shutdown() {
-    static INITIALIZE: Once = Once::new();
-    INITIALIZE.call_once(|| {
-        // Compile once during CUDA server initialization so NVRTC's nested
-        // builtins library is loaded before the process-exit shutdown hook.
-        let source =
-            CString::new("extern \"C\" __global__ void cubecl_shutdown_init() {}").unwrap();
-        // SAFETY: Calling NVRTC FFI with a null-terminated source string that
-        // outlives the program. The guard destroys the program after registration.
-        unsafe {
-            let program = NvrtcProgram(
-                cudarc::nvrtc::result::create_program(source.as_c_str(), None)
-                    .expect("NVRTC shutdown initialization should create a program"),
-            );
-            cudarc::nvrtc::result::compile_program(program.0, &[] as &[&str])
-                .expect("NVRTC shutdown initialization should compile");
-            cubecl_common::device_handle::register_device_services_backend_shutdown_hook();
-        }
-    });
-}
-
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone)]
 pub struct PtxCacheEntry {
     entrypoint_name: String,
@@ -106,7 +85,6 @@ impl CudaContext {
         arch: CudaArchitecture,
         device: cudarc::driver::sys::CUdevice,
     ) -> Self {
-        initialize_nvrtc_shutdown();
         let ptx_cache_fingerprint = ptx_cache_fingerprint(&compilation_options, &arch, device);
         Self {
             context,
