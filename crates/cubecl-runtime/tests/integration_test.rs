@@ -2,17 +2,113 @@ mod dummy;
 
 use crate::dummy::{DummyDevice, DummyElementwiseAddition, test_client};
 
+use cubecl_common::{
+    device::{Device, DeviceId},
+    future::block_on,
+    stream_id::StreamId,
+};
+use cubecl_runtime::client::ComputeClient;
+#[cfg(feature = "std")]
+use cubecl_runtime::lifecycle::RuntimeSession;
 use cubecl_runtime::local_tuner;
 use cubecl_runtime::server::{CubeCount, Handle, KernelArguments};
+use cubecl_runtime::tune::LocalTuner;
 #[cfg(feature = "autotune-checks")]
 use cubecl_runtime::tune::TuneInputs;
-use cubecl_runtime::tune::{AutotuneOutput, CloneInputGenerator, LocalTuner, Tunable, TunableSet};
+#[cfg(feature = "autotune-checks")]
+use cubecl_runtime::tune::{AutotuneOutput, CloneInputGenerator, Tunable, TunableSet};
 use dummy::*;
 #[cfg(feature = "autotune-checks")]
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+
+#[derive(Clone, Debug, Default)]
+struct IndexedDummyDevice(u16);
+
+impl Device for IndexedDummyDevice {
+    fn from_id(device_id: DeviceId) -> Self {
+        Self(device_id.index_id)
+    }
+
+    fn to_id(&self) -> DeviceId {
+        DeviceId {
+            type_id: 0,
+            index_id: self.0,
+        }
+    }
+}
+
+#[test]
+fn resource_generation_is_retained_and_validated() {
+    let client_a = ComputeClient::<DummyRuntime>::load(&IndexedDummyDevice(101));
+    let client_b = ComputeClient::<DummyRuntime>::load(&IndexedDummyDevice(102));
+    let generation_a = client_a.generation_id().unwrap();
+    let generation_b = client_b.generation_id().unwrap();
+    assert_ne!(generation_a, generation_b);
+
+    let handle = client_a.empty(4);
+    let binding = handle.clone().binding();
+    let layout = client_a.empty_tensor([4].into(), 1);
+    let resource = client_a.get_resource(handle.clone()).unwrap();
+    assert_eq!(handle.generation_id(), Some(generation_a));
+    assert_eq!(binding.generation_id(), Some(generation_a));
+    assert_eq!(layout.memory.generation_id(), Some(generation_a));
+    assert_eq!(resource.generation_id(), Some(generation_a));
+
+    let same_generation = client_a.clone();
+    assert!(same_generation.read_one(handle.clone()).is_ok());
+
+    let read_error = block_on(client_b.read_async(vec![handle.clone()])).unwrap_err();
+    assert!(format!("{read_error}").contains("doesn't match client generation"));
+    assert!(client_b.get_resource(handle.clone()).is_err());
+
+    let launch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client_b.launch(
+            Box::new(KernelTask::new(DummyElementwiseAddition)),
+            CubeCount::Static(1, 1, 1),
+            KernelArguments::new().with_buffer(handle.binding()),
+        );
+    }));
+    assert!(launch.is_err());
+
+    let unbound = Handle::new(StreamId::current(), 4);
+    assert_eq!(unbound.generation_id(), None);
+}
+
+#[test]
+#[cfg(feature = "std")]
+fn runtime_session_deduplicates_and_reports_shared_generation() {
+    let mut session = RuntimeSession::new();
+    let client = session.client::<DummyRuntime>(&DummyDevice);
+
+    assert_eq!(session.num_pinned_generations(), 1);
+    assert!(!session.pin(&client));
+    assert_eq!(session.num_pinned_generations(), 1);
+
+    let report = session.shutdown().unwrap();
+    assert_eq!(report.closed_generations(), 0);
+    assert_eq!(report.closing_generations(), 0);
+    assert_eq!(report.shared_generations(), 1);
+    assert_eq!(report.stateless_leases(), 0);
+
+    drop(client);
+}
+
+#[test]
+#[cfg(feature = "std")]
+fn runtime_session_final_pin_closes_generation() {
+    let mut session = RuntimeSession::new();
+    let client = ComputeClient::<DummyRuntime>::load(&IndexedDummyDevice(103));
+    assert!(session.pin(&client));
+    drop(client);
+
+    let report = session.shutdown().unwrap();
+    assert_eq!(report.closed_generations(), 1);
+    assert_eq!(report.closing_generations(), 0);
+    assert_eq!(report.shared_generations(), 0);
+}
 
 #[cfg(feature = "autotune-checks")]
 #[derive(Clone)]
