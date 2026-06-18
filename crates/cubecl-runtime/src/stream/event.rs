@@ -411,10 +411,33 @@ impl SharedBindingAnalysis {
 #[cfg(test)]
 mod tests {
     use crate::server::Handle;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
     const MAX_STREAMS: u8 = 4;
+
+    #[test]
+    fn test_gc_thread_shutdown_drains_tasks_and_joins() {
+        struct DropSpy(Arc<AtomicUsize>);
+
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut gc = GcThread::<TestBackend>::new();
+        for _ in 0..4 {
+            gc.register(GcTask::new(DropSpy(Arc::clone(&drop_count)), TestEvent {}));
+        }
+
+        gc.shutdown();
+        gc.shutdown();
+
+        assert_eq!(drop_count.load(Ordering::SeqCst), 4);
+    }
 
     #[test_log::test]
     fn test_analysis_shared_bindings_1() {

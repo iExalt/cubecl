@@ -30,7 +30,9 @@ pub mod device;
 /// Device handle module.
 pub mod device_handle {
     pub use super::device::handle::{
-        DeviceHandle, DeviceServicesShutdownError, shutdown_device_services,
+        DeviceGenerationId, DeviceGenerationMetrics, DeviceHandle, DeviceLease, DeviceLeaseRelease,
+        DeviceLeaseReleaseError, DeviceServicesShutdownError, device_generation_metrics,
+        shutdown_device_services,
     };
 }
 

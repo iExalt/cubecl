@@ -1,5 +1,7 @@
 use crate::device::{DeviceId, DeviceService, ServerUtilitiesHandle};
 
+use super::DeviceLease;
+
 /// An error happened while executing a call.
 #[derive(Debug)]
 pub struct CallError;
@@ -62,6 +64,9 @@ pub(crate) trait DeviceHandleSpec<S: DeviceService>: Sized {
 
     /// Retrieves the server utilities for this thread.
     fn utilities(&self) -> ServerUtilitiesHandle;
+
+    /// Returns a portable lease for the current device-runner generation.
+    fn lease(&self) -> DeviceLease;
 
     /// Doesn't flush the service state, but flushes any task enqueued in the communication
     /// channel.

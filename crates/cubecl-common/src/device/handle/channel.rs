@@ -1,22 +1,39 @@
 use crate::{
     device::{
         DeviceId, DeviceService, DeviceServiceStage, ServerUtilitiesHandle,
-        handle::{CallError, DeviceHandleSpec, DeviceServicesShutdownError, ServiceCreationError},
+        handle::{
+            CallError, DeviceHandleSpec, DeviceLease, DeviceServicesShutdownError,
+            ServiceCreationError,
+        },
     },
     stream_id::StreamId,
 };
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use std::{
     any::{Any, TypeId},
     boxed::Box,
     cell::RefCell,
     marker::PhantomData,
+    ops::Deref,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Condvar, LazyLock, Mutex},
+    sync::{Arc, Condvar, LazyLock, Mutex, Weak},
     vec::Vec,
 };
 
-use custom_channel::DeviceClient;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+pub(super) use custom_channel::ExternalLease;
+use custom_channel::{DeviceClient, GenerationCloser, GenerationUpgrade, WeakDeviceClient};
+
+static CREATED_GENERATIONS: AtomicU64 = AtomicU64::new(0);
+static CLOSED_GENERATIONS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn generation_metrics() -> (u64, u64) {
+    (
+        CREATED_GENERATIONS.load(AtomicOrdering::Relaxed),
+        CLOSED_GENERATIONS.load(AtomicOrdering::Relaxed),
+    )
+}
 
 // For debugging and benchmarking.
 //
@@ -70,6 +87,10 @@ impl<S: DeviceService + 'static> DeviceHandleSpec<S> for ChannelDeviceHandle<S> 
 
     fn utilities(&self) -> ServerUtilitiesHandle {
         self.state.utilities()
+    }
+
+    fn lease(&self) -> DeviceLease {
+        DeviceLease::channel(self.state.client.external_lease())
     }
 
     /// Runs `task` on the device thread, blocking until it returns.
@@ -219,8 +240,20 @@ struct DeviceRunner {}
 /// A simple wrapper over a client and a service that is cached with [`CHANNELS`].
 #[derive(Clone)]
 struct ChannelDeviceState {
+    inner: Arc<ChannelDeviceStateInner>,
+}
+
+struct ChannelDeviceStateInner {
     client: DeviceClient,
     service: ChannelService,
+}
+
+impl Deref for ChannelDeviceState {
+    type Target = ChannelDeviceStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 /// Cached reference to a device service's state.
@@ -235,6 +268,7 @@ struct ChannelService {
 
 struct ServiceState {
     service: RefCell<Box<dyn Any + 'static>>,
+    utilities: ServerUtilitiesHandle,
     shutdown: fn(&mut Box<dyn Any + 'static>),
 }
 
@@ -247,8 +281,10 @@ impl ServiceState {
                 .shutdown();
         }
 
+        let utilities = service.utilities();
         Self {
             service: RefCell::new(Box::new(service)),
+            utilities,
             shutdown: shutdown::<S>,
         }
     }
@@ -271,11 +307,70 @@ struct RunnerId {
     stage: DeviceServiceStage,
 }
 
-static RUNNERS: spin::Mutex<Option<HashMap<RunnerId, DeviceClient>>> = spin::Mutex::new(None);
+enum RunnerRegistryEntry {
+    Strong(DeviceClient),
+    Weak(WeakDeviceClient),
+}
+
+impl RunnerRegistryEntry {
+    fn new(client: &DeviceClient) -> Self {
+        if strong_device_registries() {
+            Self::Strong(client.clone())
+        } else {
+            Self::Weak(client.downgrade())
+        }
+    }
+
+    fn upgrade(&self) -> GenerationUpgrade {
+        match self {
+            Self::Strong(client) => client.try_clone_generation(),
+            Self::Weak(client) => client.upgrade(),
+        }
+    }
+
+    fn closer(&self) -> Option<GenerationCloser> {
+        match self {
+            Self::Strong(client) => Some(client.closer()),
+            Self::Weak(client) => client.closer(),
+        }
+    }
+}
+
+enum ChannelRegistryEntry {
+    Strong(ChannelDeviceState),
+    Weak(Weak<ChannelDeviceStateInner>),
+}
+
+impl ChannelRegistryEntry {
+    fn new(state: &ChannelDeviceState) -> Self {
+        if strong_device_registries() {
+            Self::Strong(state.clone())
+        } else {
+            Self::Weak(Arc::downgrade(&state.inner))
+        }
+    }
+
+    fn upgrade(&self) -> Option<ChannelDeviceState> {
+        match self {
+            Self::Strong(state) => Some(state.clone()),
+            Self::Weak(state) => state.upgrade().map(|inner| ChannelDeviceState { inner }),
+        }
+    }
+}
+
+static STRONG_DEVICE_REGISTRIES: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("CUBECL_STRONG_DEVICE_REGISTRIES").is_some());
+
+fn strong_device_registries() -> bool {
+    *STRONG_DEVICE_REGISTRIES
+}
+
+static RUNNERS: spin::Mutex<Option<HashMap<RunnerId, RunnerRegistryEntry>>> =
+    spin::Mutex::new(None);
 /// Device/service map. The lock is held across the entire `init` sequence so `S::init` runs
 /// once per `(DeviceId, TypeId)` pair. This serializes channel creation across all
 /// backends.
-static CHANNELS: spin::Mutex<Option<HashMap<(RunnerId, TypeId), ChannelDeviceState>>> =
+static CHANNELS: spin::Mutex<Option<HashMap<(RunnerId, TypeId), ChannelRegistryEntry>>> =
     spin::Mutex::new(None);
 
 #[derive(Default)]
@@ -290,11 +385,22 @@ static LIFECYCLE: LazyLock<(Mutex<LifecycleState>, Condvar)> =
 struct InitializationPermit;
 
 impl InitializationPermit {
-    fn acquire() -> Self {
+    fn acquire(target_stage: DeviceServiceStage) -> Self {
+        let caller_stage = SERVER_THREAD.with_borrow(|runner| runner.map(|id| id.stage));
         let (mutex, condition) = &*LIFECYCLE;
         let mut lifecycle = mutex.lock().unwrap();
         while lifecycle.shutting_down {
-            lifecycle = condition.wait(lifecycle).unwrap();
+            match caller_stage {
+                Some(caller_stage) if (caller_stage as u8) < (target_stage as u8) => break,
+                Some(caller_stage) => {
+                    drop(lifecycle);
+                    panic!(
+                        "device runner at stage {caller_stage:?} cannot initialize stage \
+                         {target_stage:?} during shutdown"
+                    );
+                }
+                None => lifecycle = condition.wait(lifecycle).unwrap(),
+            }
         }
         lifecycle.active_initializers += 1;
         Self
@@ -325,6 +431,14 @@ impl ShutdownPermit {
         }
         Self
     }
+
+    fn wait_for_initializers(&self) {
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        while lifecycle.active_initializers != 0 {
+            lifecycle = condition.wait(lifecycle).unwrap();
+        }
+    }
 }
 
 impl Drop for ShutdownPermit {
@@ -338,29 +452,74 @@ impl Drop for ShutdownPermit {
 
 /// Stops and joins every device runner.
 ///
-/// New submissions must stop before this function is called. Runners are shut
-/// down upstream-first so queued producer work is cancelled before downstream
-/// services are dropped.
+/// Runners are shut down upstream-first so accepted producer work is drained
+/// before downstream services are closed.
 pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
-    let _permit = ShutdownPermit::acquire();
-    let channels = CHANNELS.lock().take();
-
-    let mut runners = RUNNERS
-        .lock()
-        .take()
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<Vec<_>>();
-    runners.sort_by_key(|(runner_id, _)| runner_id.stage as u8);
-
+    let permit = ShutdownPermit::acquire();
     let mut runner_panics = 0;
-    for (_, runner) in runners {
-        if runner.shutdown().is_err() {
-            runner_panics += 1;
+    let downstream_pins = {
+        let guard = RUNNERS.lock();
+        guard
+            .as_ref()
+            .into_iter()
+            .flat_map(HashMap::iter)
+            .filter_map(|(runner_id, entry)| {
+                if runner_id.stage != DeviceServiceStage::Downstream {
+                    return None;
+                }
+                match entry.upgrade() {
+                    GenerationUpgrade::Ready(client) => Some(client),
+                    GenerationUpgrade::Closing(_) | GenerationUpgrade::Gone => None,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for stage in [DeviceServiceStage::Upstream, DeviceServiceStage::Downstream] {
+        permit.wait_for_initializers();
+
+        {
+            let mut guard = CHANNELS.lock();
+            let channels = guard.get_or_insert_with(HashMap::new);
+            let keys = channels
+                .keys()
+                .filter_map(|(runner_id, type_id)| {
+                    (runner_id.stage == stage).then_some((*runner_id, *type_id))
+                })
+                .collect::<Vec<_>>();
+
+            for key in keys {
+                channels.remove(&key);
+            }
+        }
+
+        let closers = {
+            let mut guard = RUNNERS.lock();
+            let runners = guard.get_or_insert_with(HashMap::new);
+            let keys = runners
+                .keys()
+                .filter(|runner_id| runner_id.stage == stage)
+                .copied()
+                .collect::<Vec<_>>();
+
+            keys.into_iter()
+                .filter_map(|key| runners.remove(&key))
+                .filter_map(|entry| entry.closer())
+                .collect::<Vec<_>>()
+        };
+
+        let mut closed = HashSet::new();
+        for closer in closers {
+            if !closed.insert(closer.generation_id()) {
+                continue;
+            }
+            if closer.shutdown().is_err() {
+                runner_panics += 1;
+            }
         }
     }
 
-    core::mem::drop(channels);
+    core::mem::drop(downstream_pins);
 
     if runner_panics == 0 {
         Ok(())
@@ -374,100 +533,132 @@ impl ChannelDeviceState {
         device_id: DeviceId,
         service: Option<S>,
     ) -> Result<Self, ServiceCreationError> {
-        let _permit = InitializationPermit::acquire();
         let type_id = TypeId::of::<S>();
         let runner_id = RunnerId {
             device: device_id,
             stage: S::stage(),
         };
+        let _permit = InitializationPermit::acquire(runner_id.stage);
         let key = (runner_id, type_id);
 
-        // Hold the `CHANNELS` lock across the entire init sequence so that the
-        // "check missing, insert new" transition is atomic. Without this, two
-        // concurrent callers for the same key would both observe a missing entry,
-        // both run `S::init`, and race to insert.
-        let mut guard_channel = CHANNELS.lock();
-        let channels = guard_channel.get_or_insert_with(HashMap::new);
+        loop {
+            // Hold `CHANNELS` across runner lookup and service initialization so concurrent callers
+            // can't initialize the same `(RunnerId, TypeId)` twice.
+            let mut guard_channel = CHANNELS.lock();
+            let channels = guard_channel.get_or_insert_with(HashMap::new);
 
-        if let Some(existing) = channels.get(&key) {
-            if service.is_some() {
-                // `insert(device, service)` cannot replace an existing state.
-                return Err(ServiceCreationError::new(
-                    "Service already initialized.".into(),
-                ));
+            if let Some(existing) = channels.get(&key).and_then(ChannelRegistryEntry::upgrade) {
+                if existing.client.is_active() {
+                    if service.is_some() {
+                        return Err(ServiceCreationError::new(
+                            "Service already initialized.".into(),
+                        ));
+                    }
+                    return Ok(existing);
+                }
+                channels.remove(&key);
             }
-            return Ok(existing.clone());
-        }
 
-        // A single device runner can serve multiple [`DeviceService`].
-        let device_client = {
-            let mut guard = RUNNERS.lock();
-            let runners = guard.get_or_insert_with(HashMap::new);
-            runners
-                .entry(runner_id)
-                .or_insert_with(|| DeviceRunner::start(runner_id))
-                .clone()
-        };
+            // A single device runner can serve multiple [`DeviceService`]. Re-read after every
+            // close wait so concurrent waiters observe a replacement installed by another caller.
+            let device_client = {
+                let mut guard = RUNNERS.lock();
+                let runners = guard.get_or_insert_with(HashMap::new);
+                let upgrade = runners
+                    .get(&runner_id)
+                    .map(RunnerRegistryEntry::upgrade)
+                    .unwrap_or(GenerationUpgrade::Gone);
+                match upgrade {
+                    GenerationUpgrade::Ready(client) => Ok(client),
+                    GenerationUpgrade::Closing(waiter) => Err(waiter),
+                    GenerationUpgrade::Gone => {
+                        let client = DeviceRunner::start(runner_id);
+                        runners.insert(runner_id, RunnerRegistryEntry::new(&client));
+                        Ok(client)
+                    }
+                }
+            };
 
-        let (callback, recv) = oneshot::channel();
+            let device_client = match device_client {
+                Ok(client) => client,
+                Err(waiter) => {
+                    drop(guard_channel);
+                    waiter.wait_closed();
+                    continue;
+                }
+            };
 
-        // The service initialization function.
-        let initialize_service = move || {
-            STATES.with(|state| {
-                let mut map = match state.try_borrow_mut() {
-                    Ok(map) => map,
-                    Err(err) => panic!(
-                        "The device service {:?} is already borrowed: {err}",
-                        core::any::type_name::<S>()
-                    ),
-                };
+            let (callback, recv) = oneshot::channel();
 
-                if service.is_some() && map.contains_key(&type_id) {
-                    callback.send(Err(())).unwrap();
-                } else {
+            // The service initialization function.
+            let initialize_service = move || {
+                STATES.with(|state| {
+                    let mut map = match state.try_borrow_mut() {
+                        Ok(map) => map,
+                        Err(err) => panic!(
+                            "The device service {:?} is already borrowed: {err}",
+                            core::any::type_name::<S>()
+                        ),
+                    };
+
+                    if let Some(existing) = map.get(&type_id) {
+                        if service.is_some() {
+                            callback.send(Err(())).unwrap();
+                        } else {
+                            callback
+                                .send(Ok(ChannelService {
+                                    type_id,
+                                    utilities: existing.utilities.clone(),
+                                }))
+                                .unwrap();
+                        }
+                        return;
+                    }
+
                     let service = service.unwrap_or_else(|| S::init(device_id));
-                    let utilities = service.utilities();
-
-                    map.entry(type_id)
-                        .or_insert_with(|| ServiceState::new(service));
+                    let state = ServiceState::new(service);
+                    let utilities = state.utilities.clone();
+                    map.insert(type_id, state);
                     callback
                         .send(Ok(ChannelService { type_id, utilities }))
                         .unwrap();
-                }
-            });
-        };
-
-        // Same reason in [`send]` we need to call the function directly if we are on the runner
-        // thread.
-        if is_device_runner_thread(&runner_id) {
-            if let Err(err) = catch_unwind(AssertUnwindSafe(initialize_service)) {
-                return Err(ServiceCreationError::new(std::format!(
-                    "Service initialization failed: {err:?}"
-                )));
+                });
             };
-        } else {
-            device_client.enqueue(initialize_service).unwrap();
-            device_client.flush();
-        };
 
-        let service = recv.recv().unwrap();
+            // Same reason in [`send]` we need to call the function directly if we are on the runner
+            // thread.
+            if is_device_runner_thread(&runner_id) {
+                if let Err(err) = catch_unwind(AssertUnwindSafe(initialize_service)) {
+                    return Err(ServiceCreationError::new(std::format!(
+                        "Service initialization failed: {err:?}"
+                    )));
+                };
+            } else {
+                device_client.enqueue(initialize_service).unwrap();
+                device_client.flush();
+            };
 
-        let service = match service {
-            Ok(service) => service,
-            Err(_) => {
-                return Err(ServiceCreationError::new(
-                    "Service already initialized.".into(),
-                ));
-            }
-        };
-        let channel = Self {
-            client: device_client,
-            service,
-        };
+            let service = recv.recv().unwrap();
 
-        channels.insert(key, channel.clone());
+            let service = match service {
+                Ok(service) => service,
+                Err(_) => {
+                    return Err(ServiceCreationError::new(
+                        "Service already initialized.".into(),
+                    ));
+                }
+            };
+            let channel = Self {
+                inner: Arc::new(ChannelDeviceStateInner {
+                    client: device_client,
+                    service,
+                }),
+            };
 
-        Ok(channel)
+            channels.insert(key, ChannelRegistryEntry::new(&channel));
+
+            return Ok(channel);
+        }
     }
 
     fn utilities(&self) -> ServerUtilitiesHandle {
@@ -731,19 +922,20 @@ mod normal_channel {
 /// no allocation (most of the time, see [`task`] for more details.
 mod custom_channel {
     use crate::device::handle::{
-        CallError,
+        CallError, DeviceGenerationId, DeviceLeaseRelease,
         channel::{
-            RunnerId,
+            CLOSED_GENERATIONS, CREATED_GENERATIONS, RunnerId, is_device_runner_thread,
             task::{ArenaSlot, GLOBAL_TASK_MAX_SIZE, Task},
         },
     };
     use core::{
         hint::spin_loop,
-        sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+        sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
         time::Duration,
     };
     use std::{
-        sync::{Arc, Mutex},
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        sync::{Arc, Condvar, Mutex, Weak},
         thread::JoinHandle,
         vec::Vec,
     };
@@ -776,26 +968,438 @@ mod custom_channel {
     /// to avoid stalling the producer's critical path.
     const SLEEP_STEP_CLIENT: Duration = Duration::from_micros(75);
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum GenerationStatus {
+        Starting,
+        Running,
+        Closing,
+        Closed,
+    }
+
+    enum BeginClose {
+        Started,
+        Shared,
+        AlreadyClosing,
+    }
+
+    pub(super) enum GenerationUpgrade {
+        Ready(DeviceClient),
+        Closing(GenerationWaiter),
+        Gone,
+    }
+
+    pub(super) struct GenerationWaiter {
+        generation: Arc<RuntimeGeneration>,
+    }
+
+    impl GenerationWaiter {
+        pub(super) fn wait_closed(self) {
+            assert!(
+                !is_device_runner_thread(&self.generation.runner_id),
+                "a device runner cannot wait for its own generation to close"
+            );
+            if self.generation.join_runner().is_err() {
+                log::warn!(
+                    "Device runner {:?} panicked before replacement",
+                    self.generation.runner_id
+                );
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct GenerationCloser {
+        generation: Arc<RuntimeGeneration>,
+    }
+
+    impl GenerationCloser {
+        pub(super) fn generation_id(&self) -> DeviceGenerationId {
+            self.generation.id
+        }
+
+        pub(super) fn shutdown(&self) -> Result<(), ()> {
+            RuntimeGeneration::close_forced(&self.generation).map(|_| ())
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct WeakDeviceClient {
+        generation: Weak<RuntimeGeneration>,
+    }
+
+    impl WeakDeviceClient {
+        pub(super) fn upgrade(&self) -> GenerationUpgrade {
+            let Some(generation) = self.generation.upgrade() else {
+                return GenerationUpgrade::Gone;
+            };
+            RuntimeGeneration::upgrade(generation)
+        }
+
+        pub(super) fn closer(&self) -> Option<GenerationCloser> {
+            self.generation
+                .upgrade()
+                .map(|generation| GenerationCloser { generation })
+        }
+    }
+
+    struct GenerationLifecycle {
+        status: GenerationStatus,
+        runner_panicked: bool,
+    }
+
+    struct RuntimeGeneration {
+        id: DeviceGenerationId,
+        runner_id: RunnerId,
+        state: Arc<State>,
+        external_count: AtomicUsize,
+        internal_count: AtomicUsize,
+        lifecycle: Mutex<GenerationLifecycle>,
+        closed: Condvar,
+        join_handle: Mutex<Option<JoinHandle<()>>>,
+        join_delegated: AtomicBool,
+    }
+
+    impl RuntimeGeneration {
+        fn new(runner_id: RunnerId, state: Arc<State>) -> Arc<Self> {
+            static NEXT_GENERATION_ID: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(1);
+
+            let generation = Arc::new(Self {
+                id: DeviceGenerationId::new(NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed)),
+                runner_id,
+                state,
+                external_count: AtomicUsize::new(0),
+                internal_count: AtomicUsize::new(0),
+                lifecycle: Mutex::new(GenerationLifecycle {
+                    status: GenerationStatus::Starting,
+                    runner_panicked: false,
+                }),
+                closed: Condvar::new(),
+                join_handle: Mutex::new(None),
+                join_delegated: AtomicBool::new(false),
+            });
+            CREATED_GENERATIONS.fetch_add(1, Ordering::Relaxed);
+            generation
+        }
+
+        fn external_lease_unchecked(self: &Arc<Self>) -> ExternalLease {
+            self.external_count.fetch_add(1, Ordering::Relaxed);
+            ExternalLease {
+                generation: Some(Arc::clone(self)),
+            }
+        }
+
+        fn upgrade(generation: Arc<Self>) -> GenerationUpgrade {
+            let lifecycle = generation.lifecycle.lock().unwrap();
+            match lifecycle.status {
+                GenerationStatus::Starting | GenerationStatus::Running => {
+                    generation.external_count.fetch_add(1, Ordering::Relaxed);
+                    drop(lifecycle);
+                    let state = Arc::clone(&generation.state);
+                    GenerationUpgrade::Ready(DeviceClient {
+                        state,
+                        lease: ExternalLease {
+                            generation: Some(generation),
+                        },
+                    })
+                }
+                GenerationStatus::Closing => {
+                    drop(lifecycle);
+                    GenerationUpgrade::Closing(GenerationWaiter { generation })
+                }
+                GenerationStatus::Closed => GenerationUpgrade::Gone,
+            }
+        }
+
+        fn internal_reference(self: &Arc<Self>) -> InternalReference {
+            self.internal_count.fetch_add(1, Ordering::Relaxed);
+            InternalReference {
+                generation: Arc::clone(self),
+            }
+        }
+
+        fn set_join_handle(&self, join_handle: JoinHandle<()>) {
+            *self.join_handle.lock().unwrap() = Some(join_handle);
+        }
+
+        fn mark_running(&self) {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            if lifecycle.status == GenerationStatus::Starting {
+                lifecycle.status = GenerationStatus::Running;
+            }
+        }
+
+        fn mark_closed(&self, panicked: bool) {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            lifecycle.runner_panicked |= panicked;
+            if lifecycle.status != GenerationStatus::Closed {
+                lifecycle.status = GenerationStatus::Closed;
+                CLOSED_GENERATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            self.closed.notify_all();
+        }
+
+        fn begin_close(&self, only_if_unowned: bool) -> BeginClose {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            match lifecycle.status {
+                GenerationStatus::Starting | GenerationStatus::Running => {
+                    if only_if_unowned && self.external_count.load(Ordering::Acquire) != 0 {
+                        return BeginClose::Shared;
+                    }
+                    lifecycle.status = GenerationStatus::Closing;
+                    drop(lifecycle);
+                    self.state.accepting.swap(false, Ordering::SeqCst);
+                    self.state.close_requested.store(true, Ordering::Release);
+                    BeginClose::Started
+                }
+                GenerationStatus::Closing | GenerationStatus::Closed => BeginClose::AlreadyClosing,
+            }
+        }
+
+        fn finish_close(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
+            if is_device_runner_thread(&generation.runner_id) {
+                Self::delegate_join(generation);
+                return Ok(DeviceLeaseRelease::Closing);
+            }
+
+            generation
+                .join_runner()
+                .map(|()| DeviceLeaseRelease::Closed)
+        }
+
+        fn close_if_unowned(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
+            match generation.begin_close(true) {
+                BeginClose::Shared => Ok(DeviceLeaseRelease::Shared),
+                BeginClose::Started | BeginClose::AlreadyClosing => Self::finish_close(generation),
+            }
+        }
+
+        fn close_forced(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
+            match generation.begin_close(false) {
+                BeginClose::Started | BeginClose::AlreadyClosing => Self::finish_close(generation),
+                BeginClose::Shared => unreachable!("forced close ignores external owners"),
+            }
+        }
+
+        fn close(generation: &Arc<Self>) -> Result<(), ()> {
+            Self::close_forced(generation).map(|_| ())
+        }
+
+        fn delegate_join(generation: &Arc<Self>) {
+            if generation.join_handle.lock().unwrap().is_none() {
+                return;
+            }
+            if generation
+                .join_delegated
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+
+            let runner_id = generation.runner_id;
+            let join_generation = Arc::clone(generation);
+            let result = std::thread::Builder::new()
+                .name(std::format!(
+                    "DS-J-{}-{}",
+                    runner_id.device.type_id,
+                    runner_id.device.index_id
+                ))
+                .spawn(move || {
+                    if join_generation.join_runner().is_err() {
+                        log::warn!(
+                            "Device runner {:?} panicked during delegated shutdown",
+                            join_generation.runner_id
+                        );
+                    }
+                });
+
+            if let Err(err) = result {
+                generation.join_delegated.store(false, Ordering::Release);
+                // The runner still owns an internal reference and will quiesce itself. Keep the
+                // join handle available in case another off-runner closer arrives.
+                log::warn!(
+                    "Failed to spawn joiner for device runner {:?}: {err}",
+                    runner_id
+                );
+            }
+        }
+
+        fn join_runner(&self) -> Result<(), ()> {
+            let join_handle = self.join_handle.lock().unwrap().take();
+            if let Some(join_handle) = join_handle {
+                let panicked = join_handle.join().is_err();
+                self.mark_closed(panicked);
+            } else {
+                let mut lifecycle = self.lifecycle.lock().unwrap();
+                while lifecycle.status != GenerationStatus::Closed {
+                    lifecycle = self.closed.wait(lifecycle).unwrap();
+                }
+            }
+
+            let lifecycle = self.lifecycle.lock().unwrap();
+            if lifecycle.runner_panicked {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        #[cfg(test)]
+        fn status(&self) -> GenerationStatus {
+            self.lifecycle.lock().unwrap().status
+        }
+    }
+
+    pub(in crate::device::handle) struct ExternalLease {
+        generation: Option<Arc<RuntimeGeneration>>,
+    }
+
+    impl ExternalLease {
+        fn generation(&self) -> &Arc<RuntimeGeneration> {
+            self.generation.as_ref().unwrap()
+        }
+
+        pub(in crate::device::handle) fn generation_id(&self) -> DeviceGenerationId {
+            self.generation().id
+        }
+
+        pub(in crate::device::handle) fn release(
+            mut self,
+        ) -> Result<
+            crate::device::handle::DeviceLeaseRelease,
+            crate::device::handle::DeviceLeaseReleaseError,
+        > {
+            self.release_inner()
+        }
+
+        fn release_inner(
+            &mut self,
+        ) -> Result<
+            crate::device::handle::DeviceLeaseRelease,
+            crate::device::handle::DeviceLeaseReleaseError,
+        > {
+            use crate::device::handle::{DeviceLeaseRelease, DeviceLeaseReleaseError};
+
+            let Some(generation) = self.generation.take() else {
+                return Ok(DeviceLeaseRelease::Stateless);
+            };
+            if generation.external_count.fetch_sub(1, Ordering::AcqRel) != 1 {
+                return Ok(DeviceLeaseRelease::Shared);
+            }
+
+            match RuntimeGeneration::close_if_unowned(&generation) {
+                Ok(outcome) => Ok(outcome),
+                Err(()) => Err(DeviceLeaseReleaseError::closed_with_runner_panic(
+                    generation.id,
+                )),
+            }
+        }
+    }
+
+    impl Clone for ExternalLease {
+        fn clone(&self) -> Self {
+            let generation = self.generation.as_ref().unwrap();
+            generation.external_count.fetch_add(1, Ordering::Relaxed);
+            Self {
+                generation: Some(Arc::clone(generation)),
+            }
+        }
+    }
+
+    impl Drop for ExternalLease {
+        fn drop(&mut self) {
+            if let Err(err) = self.release_inner() {
+                log::warn!("Device lease shutdown failed: {err}");
+            }
+        }
+    }
+
+    struct InternalReference {
+        generation: Arc<RuntimeGeneration>,
+    }
+
+    impl Drop for InternalReference {
+        fn drop(&mut self) {
+            self.generation
+                .internal_count
+                .fetch_sub(1, Ordering::Release);
+        }
+    }
+
     /// The client-side handle used to enqueue tasks.
     pub struct DeviceClient {
         state: Arc<State>,
-        join_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+        lease: ExternalLease,
     }
 
     impl Clone for DeviceClient {
         fn clone(&self) -> Self {
             Self {
                 state: self.state.clone(),
-                join_handle: self.join_handle.clone(),
+                lease: self.lease.clone(),
             }
         }
     }
 
     impl DeviceClient {
+        pub(super) fn downgrade(&self) -> WeakDeviceClient {
+            WeakDeviceClient {
+                generation: Arc::downgrade(self.lease.generation()),
+            }
+        }
+
+        pub(super) fn try_clone_generation(&self) -> GenerationUpgrade {
+            RuntimeGeneration::upgrade(Arc::clone(self.lease.generation()))
+        }
+
+        pub(super) fn closer(&self) -> GenerationCloser {
+            GenerationCloser {
+                generation: Arc::clone(self.lease.generation()),
+            }
+        }
+
+        pub(super) fn is_active(&self) -> bool {
+            matches!(
+                self.lease.generation().lifecycle.lock().unwrap().status,
+                GenerationStatus::Starting | GenerationStatus::Running
+            )
+        }
+
         /// Gets the runner id associated to the channel.
         pub fn runner_id(&self) -> &RunnerId {
-            &self.state.runner_id
+            &self.lease.generation().runner_id
         }
+
+        pub fn generation_id(&self) -> DeviceGenerationId {
+            self.lease.generation().id
+        }
+
+        pub fn external_lease(&self) -> ExternalLease {
+            self.lease.clone()
+        }
+
+        #[cfg(test)]
+        pub fn external_count(&self) -> usize {
+            self.lease
+                .generation()
+                .external_count
+                .load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        pub fn internal_count(&self) -> usize {
+            self.lease
+                .generation()
+                .internal_count
+                .load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        pub fn generation_status(&self) -> GenerationStatus {
+            self.lease.generation().status()
+        }
+
         /// Creates a new channel and spawns a server thread to process it.
         pub fn new<I, S>(runner_id: RunnerId, init: I, shutdown: S) -> Self
         where
@@ -804,43 +1408,59 @@ mod custom_channel {
         {
             let mut server = Server::new(runner_id);
             let state = server.state.clone();
+            let generation = RuntimeGeneration::new(runner_id, Arc::clone(&state));
+            let lease = generation.external_lease_unchecked();
+            let runner_reference = generation.internal_reference();
+            let runner_generation = Arc::clone(&generation);
 
             let join_handle = std::thread::Builder::new()
                 .name(std::format!(
-                    "DS{}-{}-{}",
+                    "DS{}-{}-{}-g{}",
                     match runner_id.stage {
                         crate::device::DeviceServiceStage::Upstream => "U",
                         crate::device::DeviceServiceStage::Downstream => "D",
                     },
                     runner_id.device.type_id,
-                    runner_id.device.index_id
+                    runner_id.device.index_id,
+                    generation.id.0
                 ))
                 .spawn(move || {
-                    init();
-                    server.start();
-                    shutdown();
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        init();
+                        runner_generation.mark_running();
+                        server.start();
+                        shutdown();
+                    }));
+                    core::mem::drop(runner_reference);
+
+                    if let Err(err) = result {
+                        resume_unwind(err);
+                    }
                 })
                 .unwrap();
 
-            Self {
-                state,
-                join_handle: Arc::new(Mutex::new(Some(join_handle))),
-            }
+            generation.set_join_handle(join_handle);
+
+            Self { state, lease }
         }
 
         /// Atomically reserves a slot in the buffer and writes the task.
         pub fn enqueue<F: FnOnce() + Send + 'static>(&self, func: F) -> Result<(), CallError> {
-            if !self.state.accepting.load(Ordering::Acquire) {
+            if !self.state.accepting.load(Ordering::SeqCst) {
                 return Err(CallError);
             }
-            self.state.active_enqueues.fetch_add(1, Ordering::AcqRel);
-            if !self.state.accepting.load(Ordering::Acquire) {
-                self.state.active_enqueues.fetch_sub(1, Ordering::AcqRel);
+            self.state.active_enqueues.fetch_add(1, Ordering::SeqCst);
+            if !self.state.accepting.load(Ordering::SeqCst) {
+                self.state.active_enqueues.fetch_sub(1, Ordering::SeqCst);
                 return Err(CallError);
             }
 
-            self.enqueue_unchecked(func);
-            self.state.active_enqueues.fetch_sub(1, Ordering::AcqRel);
+            let reference = self.lease.generation().internal_reference();
+            self.enqueue_unchecked(move || {
+                let _reference = reference;
+                func();
+            });
+            self.state.active_enqueues.fetch_sub(1, Ordering::SeqCst);
 
             Ok(())
         }
@@ -870,48 +1490,22 @@ mod custom_channel {
 
         /// Forces a flush by filling the remaining buffer with no-op tasks.
         pub fn flush(&self) {
-            let index_start =
-                self.state
-                    .available_index
-                    .fetch_add(CHANNEL_MAX_TASK as u32, Ordering::Acquire) as usize;
-
-            // The queue is already flushed.
-            if index_start >= CHANNEL_MAX_TASK {
+            if !self.state.accepting.load(Ordering::SeqCst) {
+                return;
+            }
+            self.state.active_enqueues.fetch_add(1, Ordering::SeqCst);
+            if !self.state.accepting.load(Ordering::SeqCst) {
+                self.state.active_enqueues.fetch_sub(1, Ordering::SeqCst);
                 return;
             }
 
-            // We clamp the number of no-op to the required amount.
-            //
-            // # Notes
-            //
-            // index_end != index_start + CHANNEL_MAX_TASK;
-            let index_end = CHANNEL_MAX_TASK;
-
-            for index in index_start..index_end {
-                self.state.init_task_at(index, || ());
-            }
-
-            let actual_added = index_end - index_start;
-            self.state
-                .enqueued_count
-                .fetch_add(actual_added as u32, Ordering::SeqCst);
+            self.state.publish_partial_buffer();
+            self.state.active_enqueues.fetch_sub(1, Ordering::SeqCst);
         }
 
-        /// Stops accepting work, cancels queued tasks, and joins the runner.
+        /// Stops accepting work, drains queued tasks, and joins the runner.
         pub fn shutdown(&self) -> Result<(), ()> {
-            if self.state.accepting.swap(false, Ordering::AcqRel) {
-                while self.state.active_enqueues.load(Ordering::Acquire) != 0 {
-                    std::thread::yield_now();
-                }
-
-                self.state.shutdown_requested.store(true, Ordering::Release);
-            }
-
-            if let Some(join_handle) = self.join_handle.lock().unwrap().take() {
-                join_handle.join().map_err(|_| ())?;
-            }
-
-            Ok(())
+            RuntimeGeneration::close(self.lease.generation())
         }
 
         #[cfg(test)]
@@ -935,10 +1529,8 @@ mod custom_channel {
         accepting: AtomicBool,
         /// Number of clients currently writing queue slots.
         active_enqueues: AtomicU32,
-        /// Whether the server should stop after draining its current task buffer.
-        shutdown_requested: AtomicBool,
-        /// The runner id (for debugging purposes).
-        runner_id: RunnerId,
+        /// Whether the server should stop after draining every accepted task.
+        close_requested: AtomicBool,
     }
 
     impl State {
@@ -949,6 +1541,23 @@ mod custom_channel {
             // SAFETY: queue_ptr points to a valid buffer of CHANNEL_MAX_TASK tasks,
             // bounds checked above, and the &mut doesn't escape.
             unsafe { &mut *self.queue_ptr.load(Ordering::Acquire).add(index) }.init(func);
+        }
+
+        fn publish_partial_buffer(&self) {
+            let index_start =
+                self.available_index
+                    .fetch_add(CHANNEL_MAX_TASK as u32, Ordering::Acquire) as usize;
+
+            if index_start >= CHANNEL_MAX_TASK {
+                return;
+            }
+
+            for index in index_start..CHANNEL_MAX_TASK {
+                self.init_task_at(index, || ());
+            }
+
+            self.enqueued_count
+                .fetch_add((CHANNEL_MAX_TASK - index_start) as u32, Ordering::SeqCst);
         }
     }
 
@@ -987,7 +1596,7 @@ mod custom_channel {
     }
 
     impl Server {
-        fn new(runner_id: RunnerId) -> Self {
+        fn new(_runner_id: RunnerId) -> Self {
             let mut buffers = [TaskBuffer::new(), TaskBuffer::new()];
 
             let state = Arc::new(State {
@@ -996,8 +1605,7 @@ mod custom_channel {
                 enqueued_count: AtomicU32::new(0),
                 accepting: AtomicBool::new(true),
                 active_enqueues: AtomicU32::new(0),
-                shutdown_requested: AtomicBool::new(false),
-                runner_id,
+                close_requested: AtomicBool::new(false),
             });
 
             Self {
@@ -1012,10 +1620,6 @@ mod custom_channel {
         fn start(&mut self) {
             let mut idle_count: u32 = 0;
             loop {
-                if self.state.shutdown_requested.load(Ordering::Acquire) {
-                    return;
-                }
-
                 if self.ready_to_execute {
                     self.execute_tasks();
                     idle_count = 0;
@@ -1026,6 +1630,18 @@ mod custom_channel {
                 if queue_size >= CHANNEL_MAX_TASK {
                     self.fetch();
                     idle_count = 0;
+                    continue;
+                }
+
+                if self.state.close_requested.load(Ordering::Acquire)
+                    && self.state.active_enqueues.load(Ordering::SeqCst) == 0
+                {
+                    let queue_size = self.state.enqueued_count.load(Ordering::SeqCst) as usize;
+                    if queue_size == 0 {
+                        return;
+                    }
+
+                    self.state.publish_partial_buffer();
                     continue;
                 }
 
@@ -1073,6 +1689,7 @@ mod custom_channel {
 
 #[cfg(test)]
 mod tests {
+    use crate::device::handle::DeviceLeaseRelease;
     use crate::device::handle::channel::custom_channel::CHANNEL_MAX_TASK;
 
     use super::*;
@@ -1151,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_cancels_buffered_tasks_and_drops_captures() {
+    fn test_shutdown_drains_buffered_tasks_and_drops_captures() {
         struct DropSpy(Arc<AtomicUsize>);
 
         impl Drop for DropSpy {
@@ -1201,8 +1818,660 @@ mod tests {
         task_release_tx.send(()).unwrap();
         shutdown_thread.join().unwrap();
 
-        assert_eq!(run_count.load(Ordering::SeqCst), 0);
+        assert_eq!(run_count.load(Ordering::SeqCst), 1);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_final_external_drop_off_runner_closes_generation() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 102,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            move || SERVER_THREAD.with_borrow_mut(|state| *state = Some(runner_id)),
+            move || shutdown_tx.send(()).unwrap(),
+        );
+
+        drop(client);
+
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("final external drop should join the runner");
+    }
+
+    #[test]
+    fn test_explicit_final_lease_release_closes_generation() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 109,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || shutdown_tx.send(()).unwrap(),
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        client.enqueue(move || ready_tx.send(()).unwrap()).unwrap();
+        client.flush();
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let lease = client.external_lease();
+        drop(client);
+
+        assert_eq!(lease.release().unwrap(), DeviceLeaseRelease::Closed);
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("final explicit release should join the runner");
+    }
+
+    #[test]
+    fn test_explicit_shared_lease_release_leaves_generation_running() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 110,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || shutdown_tx.send(()).unwrap(),
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        client.enqueue(move || ready_tx.send(()).unwrap()).unwrap();
+        client.flush();
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let lease = client.external_lease();
+
+        assert_eq!(lease.release().unwrap(), DeviceLeaseRelease::Shared);
+        assert_eq!(
+            client.generation_status(),
+            custom_channel::GenerationStatus::Running
+        );
+        assert!(shutdown_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        drop(client);
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the remaining owner should close the runner");
+    }
+
+    #[test]
+    fn test_explicit_final_release_reports_closed_runner_panic() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 111,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let client = custom_channel::DeviceClient::new(runner_id, || {}, || panic!("shutdown"));
+        let generation_id = client.generation_id();
+        let lease = client.external_lease();
+        drop(client);
+
+        let error = lease.release().unwrap_err();
+        assert_eq!(error.generation_id(), generation_id);
+    }
+
+    #[test]
+    fn test_explicit_final_release_on_runner_reports_closing() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 112,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            move || SERVER_THREAD.with_borrow_mut(|state| *state = Some(runner_id)),
+            move || shutdown_tx.send(()).unwrap(),
+        );
+        let lease = client.external_lease();
+        client
+            .enqueue(move || outcome_tx.send(lease.release().unwrap()).unwrap())
+            .unwrap();
+        client.flush();
+        drop(client);
+
+        assert_eq!(
+            outcome_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DeviceLeaseRelease::Closing
+        );
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("delegated join should complete after the runner task returns");
+    }
+
+    #[test]
+    fn test_registered_final_drop_closes_and_recreates_generation() {
+        struct LifecycleService {
+            shutdown_tx: Option<mpsc::Sender<()>>,
+        }
+
+        impl DeviceService for LifecycleService {
+            fn init(_id: DeviceId) -> Self {
+                unreachable!()
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                self.shutdown_tx.take().unwrap().send(()).unwrap();
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 113,
+        };
+        let (first_tx, first_rx) = mpsc::channel();
+        let first = ChannelDeviceHandle::<LifecycleService>::insert(
+            device_id,
+            LifecycleService {
+                shutdown_tx: Some(first_tx),
+            },
+        )
+        .unwrap();
+        let first_generation = first.state.client.generation_id();
+        drop(first);
+        first_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("weak registries must not pin the first generation");
+
+        let (second_tx, second_rx) = mpsc::channel();
+        let second = ChannelDeviceHandle::<LifecycleService>::insert(
+            device_id,
+            LifecycleService {
+                shutdown_tx: Some(second_tx),
+            },
+        )
+        .unwrap();
+        assert_ne!(first_generation, second.state.client.generation_id());
+        drop(second);
+        second_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement generation should also close on final drop");
+    }
+
+    #[test]
+    fn test_generation_metrics_track_create_and_close() {
+        const CHILD_ENV: &str = "CUBECL_GENERATION_METRICS_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("test_generation_metrics_track_create_and_close")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "generation-metrics child process failed");
+            return;
+        }
+
+        let before = crate::device::handle::device_generation_metrics();
+        for index_id in [118, 119] {
+            let handle = ChannelDeviceHandle::<MockService>::new(DeviceId {
+                type_id: 0,
+                index_id,
+            });
+            drop(handle);
+        }
+        let delta = crate::device::handle::device_generation_metrics().delta(before);
+
+        assert_eq!(2, delta.created_generations());
+        assert_eq!(2, delta.closed_generations());
+        assert_eq!(0, delta.active_generations());
+    }
+
+    #[test]
+    fn test_lease_reattaches_service_without_reinitializing() {
+        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        struct ReattachService;
+
+        impl DeviceService for ReattachService {
+            fn init(_id: DeviceId) -> Self {
+                INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+        }
+
+        INIT_CALLS.store(0, Ordering::SeqCst);
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 114,
+        };
+        let first = ChannelDeviceHandle::<ReattachService>::new(device_id);
+        let generation = first.state.client.generation_id();
+        let lease = first.lease();
+        drop(first);
+
+        let second = ChannelDeviceHandle::<ReattachService>::new(device_id);
+        assert_eq!(generation, second.state.client.generation_id());
+        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+
+        drop(lease);
+        drop(second);
+    }
+
+    #[test]
+    fn test_closing_generation_waiters_share_one_replacement() {
+        use std::sync::{Mutex as StdMutex, OnceLock};
+
+        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static SHUTDOWN_STARTED: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+        static RELEASE_SHUTDOWN: OnceLock<StdMutex<mpsc::Receiver<()>>> = OnceLock::new();
+
+        struct WaitingService {
+            block_shutdown: bool,
+        }
+
+        impl DeviceService for WaitingService {
+            fn init(_id: DeviceId) -> Self {
+                INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+                Self {
+                    block_shutdown: false,
+                }
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                if self.block_shutdown {
+                    SHUTDOWN_STARTED.get().unwrap().send(()).unwrap();
+                    RELEASE_SHUTDOWN
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .recv()
+                        .unwrap();
+                }
+            }
+        }
+
+        INIT_CALLS.store(0, Ordering::SeqCst);
+        let (started_tx, started_rx) = mpsc::channel();
+        SHUTDOWN_STARTED.set(started_tx).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        RELEASE_SHUTDOWN.set(StdMutex::new(release_rx)).unwrap();
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 115,
+        };
+        let old = ChannelDeviceHandle::<WaitingService>::insert(
+            device_id,
+            WaitingService {
+                block_shutdown: true,
+            },
+        )
+        .unwrap();
+        let shutdown_client = old.state.client.clone();
+        let shutdown_thread = std::thread::spawn(move || shutdown_client.shutdown().unwrap());
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let first_waiter =
+            std::thread::spawn(move || ChannelDeviceHandle::<WaitingService>::new(device_id));
+        let second_waiter =
+            std::thread::spawn(move || ChannelDeviceHandle::<WaitingService>::new(device_id));
+        release_tx.send(()).unwrap();
+        shutdown_thread.join().unwrap();
+
+        let first = first_waiter.join().unwrap();
+        let second = second_waiter.join().unwrap();
+        assert_eq!(
+            first.state.client.generation_id(),
+            second.state.client.generation_id()
+        );
+        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+
+        drop((old, first, second));
+    }
+
+    #[test]
+    fn test_concurrent_final_drop_and_reacquire_returns_usable_generation() {
+        use std::sync::Barrier;
+
+        const ITERATIONS: u16 = 100;
+        for iteration in 0..ITERATIONS {
+            let device_id = DeviceId {
+                type_id: 0,
+                index_id: 400 + iteration,
+            };
+            let old = ChannelDeviceHandle::<MockService>::new(device_id);
+            let barrier = Arc::new(Barrier::new(2));
+            let drop_barrier = Arc::clone(&barrier);
+            let drop_thread = std::thread::spawn(move || {
+                drop_barrier.wait();
+                drop(old);
+            });
+            let acquire_thread = std::thread::spawn(move || {
+                barrier.wait();
+                ChannelDeviceHandle::<MockService>::new(device_id)
+            });
+
+            drop_thread.join().unwrap();
+            let current = acquire_thread.join().unwrap();
+            assert_eq!(
+                current.submit_blocking(|service| service.id).unwrap(),
+                device_id
+            );
+            drop(current);
+        }
+    }
+
+    #[test]
+    fn test_stale_channel_is_not_reused_after_forced_shutdown() {
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 117,
+        };
+        let stale = ChannelDeviceHandle::<MockService>::new(device_id);
+        let stale_generation = stale.state.client.generation_id();
+        stale.state.client.shutdown().unwrap();
+
+        let replacement = ChannelDeviceHandle::<MockService>::new(device_id);
+        assert_ne!(stale_generation, replacement.state.client.generation_id());
+        assert_eq!(
+            replacement.submit_blocking(|service| service.id).unwrap(),
+            device_id
+        );
+
+        drop((stale, replacement));
+    }
+
+    #[test]
+    fn test_strong_registry_rollback_switch() {
+        const CHILD_ENV: &str = "CUBECL_STRONG_REGISTRY_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("test_strong_registry_rollback_switch")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .env("CUBECL_STRONG_DEVICE_REGISTRIES", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "strong-registry child process failed");
+            return;
+        }
+
+        struct RollbackService {
+            shutdown_tx: Option<mpsc::Sender<()>>,
+        }
+
+        impl DeviceService for RollbackService {
+            fn init(_id: DeviceId) -> Self {
+                unreachable!()
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                self.shutdown_tx.take().unwrap().send(()).unwrap();
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 116,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let first = ChannelDeviceHandle::<RollbackService>::insert(
+            device_id,
+            RollbackService {
+                shutdown_tx: Some(shutdown_tx),
+            },
+        )
+        .unwrap();
+        let generation = first.state.client.generation_id();
+        drop(first);
+
+        assert!(
+            shutdown_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "strong registry rollback must pin the generation"
+        );
+        let second = ChannelDeviceHandle::<RollbackService>::new(device_id);
+        assert_eq!(generation, second.state.client.generation_id());
+        drop(second);
+
+        shutdown_device_services().unwrap();
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("explicit shutdown should release strong registry pins");
+    }
+
+    #[test]
+    fn test_final_external_drop_on_runner_delegates_join() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 103,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (task_started_tx, task_started_rx) = mpsc::channel();
+        let (task_release_tx, task_release_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || shutdown_tx.send(()).unwrap(),
+        );
+        let task_client = client.clone();
+
+        client
+            .enqueue(move || {
+                task_started_tx.send(()).unwrap();
+                task_release_rx.recv().unwrap();
+                drop(task_client);
+            })
+            .unwrap();
+        client.flush();
+        task_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
+
+        drop(client);
+        task_release_tx.send(()).unwrap();
+
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runner should tear down after the triggering task returns");
+    }
+
+    #[test]
+    fn test_generation_reference_counts_are_independent() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 104,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (task_started_tx, task_started_rx) = mpsc::channel();
+        let (task_release_tx, task_release_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+
+        assert_eq!(client.external_count(), 1);
+        assert_eq!(client.internal_count(), 1);
+
+        let clone = client.clone();
+        assert_eq!(client.external_count(), 2);
+        drop(clone);
+        assert_eq!(client.external_count(), 1);
+
+        client
+            .enqueue(move || {
+                task_started_tx.send(()).unwrap();
+                task_release_rx.recv().unwrap();
+            })
+            .unwrap();
+        client.flush();
+        task_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
+        assert_eq!(client.internal_count(), 2);
+
+        task_release_tx.send(()).unwrap();
+        client.shutdown().unwrap();
+        assert_eq!(client.internal_count(), 0);
+        assert_eq!(
+            client.generation_status(),
+            custom_channel::GenerationStatus::Closed
+        );
+    }
+
+    #[test]
+    fn test_concurrent_close_is_idempotent() {
+        use std::sync::Barrier;
+
+        const CLOSERS: usize = 4;
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 105,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let shutdown_count = Arc::new(AtomicUsize::new(0));
+        let shutdown_count_runner = Arc::clone(&shutdown_count);
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || {
+                shutdown_count_runner.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let barrier = Arc::new(Barrier::new(CLOSERS));
+        let mut closers = Vec::new();
+
+        for _ in 0..CLOSERS {
+            let client = client.clone();
+            let barrier = Arc::clone(&barrier);
+            closers.push(std::thread::spawn(move || {
+                barrier.wait();
+                client.shutdown().unwrap();
+            }));
+        }
+        for closer in closers {
+            closer.join().unwrap();
+        }
+
+        assert_eq!(shutdown_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.generation_status(),
+            custom_channel::GenerationStatus::Closed
+        );
+    }
+
+    #[test]
+    fn test_close_drains_tasks_accepted_concurrently() {
+        use std::sync::Barrier;
+
+        const PRODUCERS: usize = 4;
+        const ITERATIONS: u16 = 100;
+
+        for iteration in 0..ITERATIONS {
+            let runner_id = RunnerId {
+                device: DeviceId {
+                    type_id: 0,
+                    index_id: 200 + iteration,
+                },
+                stage: DeviceServiceStage::Downstream,
+            };
+            let client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+            let barrier = Arc::new(Barrier::new(PRODUCERS + 1));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let executed = Arc::new(AtomicUsize::new(0));
+            let mut producers = Vec::new();
+
+            for _ in 0..PRODUCERS {
+                let client = client.clone();
+                let barrier = Arc::clone(&barrier);
+                let accepted = Arc::clone(&accepted);
+                let executed = Arc::clone(&executed);
+                producers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    if client
+                        .enqueue(move || {
+                            executed.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .is_ok()
+                    {
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            }
+
+            barrier.wait();
+            client.shutdown().unwrap();
+            for producer in producers {
+                producer.join().unwrap();
+            }
+
+            assert_eq!(
+                accepted.load(Ordering::SeqCst),
+                executed.load(Ordering::SeqCst),
+                "Iteration {iteration} lost an accepted task"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stale_generation_close_does_not_close_replacement() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 106,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let old_client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+        let stale_client = old_client.clone();
+        let old_generation = old_client.generation_id();
+        old_client.shutdown().unwrap();
+
+        let new_client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+        let new_generation = new_client.generation_id();
+        assert_ne!(old_generation, new_generation);
+
+        stale_client.shutdown().unwrap();
+        let (task_tx, task_rx) = mpsc::channel();
+        new_client
+            .enqueue(move || task_tx.send(()).unwrap())
+            .unwrap();
+        new_client.flush();
+        task_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale close must not affect the replacement generation");
+        new_client.shutdown().unwrap();
     }
 
     #[test]
@@ -1231,6 +2500,289 @@ mod tests {
 
         assert_eq!(res, 1);
         assert_eq!(res2, 2);
+    }
+
+    #[test]
+    fn test_services_share_generation_by_runner_id() {
+        struct OtherService;
+        struct UpstreamService;
+
+        impl DeviceService for OtherService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+        }
+
+        impl DeviceService for UpstreamService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn stage() -> DeviceServiceStage {
+                DeviceServiceStage::Upstream
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 107,
+        };
+        let first = ChannelDeviceHandle::<MockService>::new(device_id);
+        let second = ChannelDeviceHandle::<OtherService>::new(device_id);
+        let upstream = ChannelDeviceHandle::<UpstreamService>::new(device_id);
+
+        assert_eq!(
+            first.state.client.generation_id(),
+            second.state.client.generation_id()
+        );
+        assert_ne!(
+            first.state.client.generation_id(),
+            upstream.state.client.generation_id()
+        );
+
+        let external_count = first.state.client.external_count();
+        let lease = first.lease();
+        assert_eq!(
+            lease.generation_id(),
+            Some(first.state.client.generation_id())
+        );
+        assert_eq!(first.state.client.external_count(), external_count + 1);
+        drop(lease);
+        assert_eq!(first.state.client.external_count(), external_count);
+    }
+
+    #[test]
+    fn test_staged_shutdown_allows_upstream_to_initialize_downstream() {
+        const CHILD_ENV: &str = "CUBECL_STAGED_SHUTDOWN_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("test_staged_shutdown_allows_upstream_to_initialize_downstream")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "staged shutdown child process failed");
+            return;
+        }
+
+        use std::sync::{Mutex as StdMutex, OnceLock};
+
+        static EVENTS: OnceLock<mpsc::Sender<&'static str>> = OnceLock::new();
+        static RELEASE_UPSTREAM: OnceLock<StdMutex<mpsc::Receiver<()>>> = OnceLock::new();
+
+        struct DownstreamService;
+        struct ExternalService;
+        struct OtherUpstreamService;
+        struct UpstreamService;
+
+        impl DeviceService for DownstreamService {
+            fn init(_id: DeviceId) -> Self {
+                EVENTS.get().unwrap().send("downstream_init").unwrap();
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                let rejected = catch_unwind(AssertUnwindSafe(|| {
+                    ChannelDeviceHandle::<OtherUpstreamService>::new(DeviceId {
+                        type_id: 9,
+                        index_id: 4,
+                    })
+                }));
+                assert!(rejected.is_err());
+                EVENTS
+                    .get()
+                    .unwrap()
+                    .send("downstream_to_upstream_rejected")
+                    .unwrap();
+                EVENTS.get().unwrap().send("downstream_shutdown").unwrap();
+            }
+        }
+
+        impl DeviceService for ExternalService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+        }
+
+        impl DeviceService for OtherUpstreamService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn stage() -> DeviceServiceStage {
+                DeviceServiceStage::Upstream
+            }
+        }
+
+        impl DeviceService for UpstreamService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                EVENTS.get().unwrap().send("upstream_start").unwrap();
+                RELEASE_UPSTREAM
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .unwrap();
+
+                let downstream = ChannelDeviceHandle::<DownstreamService>::new(DeviceId {
+                    type_id: 9,
+                    index_id: 2,
+                });
+                downstream
+                    .submit_blocking(|_| {
+                        EVENTS.get().unwrap().send("downstream_use").unwrap();
+                    })
+                    .unwrap();
+                assert_eq!(
+                    downstream.state.client.generation_status(),
+                    custom_channel::GenerationStatus::Running
+                );
+                drop(downstream);
+
+                let rejected = catch_unwind(AssertUnwindSafe(|| {
+                    ChannelDeviceHandle::<OtherUpstreamService>::new(DeviceId {
+                        type_id: 9,
+                        index_id: 3,
+                    })
+                }));
+                assert!(rejected.is_err());
+                EVENTS.get().unwrap().send("same_stage_rejected").unwrap();
+                EVENTS.get().unwrap().send("upstream_done").unwrap();
+            }
+
+            fn stage() -> DeviceServiceStage {
+                DeviceServiceStage::Upstream
+            }
+        }
+
+        let (events_tx, events_rx) = mpsc::channel();
+        EVENTS.set(events_tx).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        RELEASE_UPSTREAM.set(StdMutex::new(release_rx)).unwrap();
+
+        let upstream = ChannelDeviceHandle::<UpstreamService>::new(DeviceId {
+            type_id: 9,
+            index_id: 1,
+        });
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::channel();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_device_services().unwrap();
+            shutdown_done_tx.send(()).unwrap();
+        });
+
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "upstream_start"
+        );
+
+        let (external_done_tx, external_done_rx) = mpsc::channel();
+        let external_thread = std::thread::spawn(move || {
+            let handle = ChannelDeviceHandle::<ExternalService>::new(DeviceId {
+                type_id: 9,
+                index_id: 5,
+            });
+            external_done_tx.send(()).unwrap();
+            handle
+        });
+        assert!(
+            external_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "external initialization must remain parked during shutdown"
+        );
+
+        release_tx.send(()).unwrap();
+        let events = (0..6)
+            .map(|_| events_rx.recv_timeout(Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+        let position = |event| events.iter().position(|item| *item == event).unwrap();
+        assert!(position("downstream_init") < position("downstream_use"));
+        assert!(position("same_stage_rejected") < position("upstream_done"));
+        assert!(position("downstream_to_upstream_rejected") < position("downstream_shutdown"));
+
+        shutdown_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown must not count the parked external initializer");
+        shutdown_thread.join().unwrap();
+        external_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("external initialization should resume after shutdown");
+        let external = external_thread.join().unwrap();
+
+        drop((upstream, external));
+        shutdown_device_services().unwrap();
+    }
+
+    #[test]
+    fn test_on_runner_close_releases_service_borrow_before_shutdown() {
+        struct ShutdownService {
+            shutdown_tx: Option<mpsc::Sender<()>>,
+        }
+
+        impl DeviceService for ShutdownService {
+            fn init(_id: DeviceId) -> Self {
+                unreachable!()
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                self.shutdown_tx.take().unwrap().send(()).unwrap();
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 108,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let handle = ChannelDeviceHandle::<ShutdownService>::insert(
+            device_id,
+            ShutdownService {
+                shutdown_tx: Some(shutdown_tx),
+            },
+        )
+        .unwrap();
+        let shutdown_client = handle.state.client.clone();
+
+        handle.submit(move |_| shutdown_client.shutdown().unwrap());
+        handle.flush_queue();
+
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("service shutdown should run after the task releases its borrow");
     }
 
     #[test]
@@ -1461,14 +3013,19 @@ mod tests {
                 ChannelDeviceHandle::<CountingService>::new(device_id)
             }));
         }
-        for h in handles {
-            let _ = h.join().unwrap();
-        }
+        let generation_ids = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().state.client.generation_id())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             INIT_CALLS.load(Ordering::SeqCst),
             1,
             "CountingService::init must run exactly once across {THREADS} racing callers"
+        );
+        assert!(
+            generation_ids.windows(2).all(|ids| ids[0] == ids[1]),
+            "Concurrent initialization must reuse one generation"
         );
     }
 

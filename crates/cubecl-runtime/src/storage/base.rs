@@ -1,5 +1,6 @@
 use crate::{memory_management::ManagedMemoryBinding, server::IoError, storage_id_type};
 use core::fmt::Debug;
+use cubecl_common::device_handle::{DeviceGenerationId, DeviceLease};
 
 // This ID is used to map a handle to its actual data.
 storage_id_type!(StorageId);
@@ -95,7 +96,7 @@ pub trait ComputeStorage: Send {
 }
 
 /// Access to the underlying resource.
-#[derive(new, Debug)]
+#[derive(Debug)]
 pub struct ManagedResource<Resource: Send> {
     // This handle is here just to keep the underlying allocation alive.
     // If the underlying allocation becomes invalid, someone else might
@@ -103,9 +104,19 @@ pub struct ManagedResource<Resource: Send> {
     #[allow(unused)]
     binding: ManagedMemoryBinding,
     resource: Resource,
+    lease: Option<DeviceLease>,
 }
 
 impl<Resource: Send> ManagedResource<Resource> {
+    /// Creates a managed resource backed by the given binding.
+    pub fn new(binding: ManagedMemoryBinding, resource: Resource) -> Self {
+        Self {
+            binding,
+            resource,
+            lease: None,
+        }
+    }
+
     /// access the underlying resource.
     ///
     /// # Note
@@ -121,5 +132,15 @@ impl<Resource: Send> ManagedResource<Resource> {
     /// Mutable access to the underlying resource.
     pub fn resource_mut(&mut self) -> &mut Resource {
         &mut self.resource
+    }
+
+    /// Returns the device-runner generation retained by this resource, when applicable.
+    pub fn generation_id(&self) -> Option<DeviceGenerationId> {
+        self.lease.as_ref().and_then(DeviceLease::generation_id)
+    }
+
+    pub(crate) fn with_lease(mut self, lease: DeviceLease) -> Self {
+        self.lease = Some(lease);
+        self
     }
 }

@@ -1,4 +1,7 @@
-use cubecl_common::stream_id::StreamId;
+use cubecl_common::{
+    device_handle::{DeviceGenerationId, DeviceLease},
+    stream_id::StreamId,
+};
 use cubecl_zspace::{Shape, Strides};
 
 use crate::{
@@ -18,6 +21,7 @@ pub struct Handle {
     pub stream: StreamId,
     /// Length of the underlying buffer ignoring offsets
     pub(crate) size: u64,
+    lease: Option<DeviceLease>,
 }
 
 impl core::fmt::Debug for Handle {
@@ -28,6 +32,7 @@ impl core::fmt::Debug for Handle {
             .field("offset_end", &self.offset_end)
             .field("stream", &self.stream)
             .field("size", &self.size)
+            .field("generation_id", &self.generation_id())
             .finish()
     }
 }
@@ -40,6 +45,7 @@ impl Clone for Handle {
             offset_end: self.offset_end,
             stream: self.stream,
             size: self.size,
+            lease: self.lease.clone(),
         }
     }
 }
@@ -53,6 +59,7 @@ impl Handle {
             offset_end: None,
             stream,
             size,
+            lease: None,
         }
     }
     /// Creates a new handle of the given size.
@@ -63,6 +70,7 @@ impl Handle {
             offset_end: None,
             stream,
             size,
+            lease: None,
         }
     }
     /// Checks whether the handle can be mutated in-place without affecting other computation.
@@ -77,13 +85,14 @@ impl Handle {
 
     /// Returns the [`Binding`] corresponding to the current handle.
     pub fn binding(self) -> Binding {
-        Binding {
-            memory: self.memory.binding(),
-            offset_start: self.offset_start,
-            offset_end: self.offset_end,
-            stream: self.stream,
-            size: self.size,
-        }
+        Binding::new(
+            self.memory.binding(),
+            self.offset_start,
+            self.offset_end,
+            self.stream,
+            self.size,
+            self.lease,
+        )
     }
 
     /// Add to the current offset in bytes.
@@ -129,6 +138,19 @@ impl Handle {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    /// Returns the device-runner generation retained by this handle, when applicable.
+    pub fn generation_id(&self) -> Option<DeviceGenerationId> {
+        self.lease.as_ref().and_then(DeviceLease::generation_id)
+    }
+
+    pub(crate) fn set_lease(&mut self, lease: DeviceLease) {
+        self.lease = Some(lease);
+    }
+
+    pub(crate) fn clear_lease(&mut self) {
+        self.lease = None;
+    }
 }
 
 /// A binding represents a [Handle] that is bound to managed memory.
@@ -151,9 +173,29 @@ pub struct Binding {
     pub stream: StreamId,
     /// Length of the underlying buffer ignoring offsets
     pub size: u64,
+    lease: Option<DeviceLease>,
 }
 
 impl Binding {
+    /// Creates a binding for managed memory.
+    pub fn new(
+        memory: ManagedMemoryBinding,
+        offset_start: Option<u64>,
+        offset_end: Option<u64>,
+        stream: StreamId,
+        size: u64,
+        lease: Option<DeviceLease>,
+    ) -> Self {
+        Self {
+            memory,
+            offset_start,
+            offset_end,
+            stream,
+            size,
+            lease,
+        }
+    }
+
     /// Get the size of the handle, in bytes, accounting for offsets
     pub fn size_in_used(&self) -> u64 {
         self.size - self.offset_start.unwrap_or(0) - self.offset_end.unwrap_or(0)
@@ -161,5 +203,14 @@ impl Binding {
     /// Get the total size of the handle, in bytes.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Returns the device-runner generation retained by this binding, when applicable.
+    pub fn generation_id(&self) -> Option<DeviceGenerationId> {
+        self.lease.as_ref().and_then(DeviceLease::generation_id)
+    }
+
+    pub(crate) fn clear_lease(&mut self) {
+        self.lease = None;
     }
 }

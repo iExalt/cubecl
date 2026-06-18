@@ -43,6 +43,12 @@ impl<C: WgpuCompiler> DeviceService for WgpuServer<C> {
     fn utilities(&self) -> ServerUtilitiesHandle {
         self.utilities.clone() as ServerUtilitiesHandle
     }
+
+    fn shutdown(&mut self) {
+        if let Err(err) = self.shutdown() {
+            log::warn!("Unable to synchronize wgpu during shutdown: {err}");
+        }
+    }
 }
 
 impl<C: WgpuCompiler> Runtime for WgpuRuntime<C> {

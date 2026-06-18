@@ -259,6 +259,18 @@ impl ServerCommunication for HipServer {
 }
 
 impl HipServer {
+    /// Waits for all work submitted to the current HIP device.
+    pub(crate) fn shutdown(&mut self) -> Result<(), cubecl_hip_sys::hipError_t> {
+        // SAFETY: The server runs on the dedicated device thread that selected this device during
+        // initialization, and shutdown runs only after accepted server tasks have drained.
+        let status = unsafe { cubecl_hip_sys::hipDeviceSynchronize() };
+        if status == cubecl_hip_sys::HIP_SUCCESS {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+
     /// Create a new hip server.
     pub(crate) fn new(
         ctx: HipContext,

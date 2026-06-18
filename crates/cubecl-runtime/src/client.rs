@@ -1,18 +1,18 @@
 use crate::{
     config::{TypeNameFormatLevel, type_name_format},
-    kernel::KernelMetadata,
+    kernel::{KernelCompilationContext, KernelMetadata},
     logging::ProfileLevel,
     memory_management::{MemoryAllocationMode, MemoryUsage},
     runtime::Runtime,
     server::{
-        CommunicationId, ComputeServer, CopyDescriptor, CubeCount, ExecutionMode, Handle, IoError,
-        KernelArguments, MemoryLayout, MemoryLayoutDescriptor, MemoryLayoutPolicy,
+        Binding, CommunicationId, ComputeServer, CopyDescriptor, CubeCount, ExecutionMode, Handle,
+        IoError, KernelArguments, MemoryLayout, MemoryLayoutDescriptor, MemoryLayoutPolicy,
         MemoryLayoutStrategy, ProfileError, ReduceOperation, ServerCommunication, ServerError,
         ServerUtilities,
     },
     storage::{ComputeStorage, ManagedResource},
 };
-use alloc::{format, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, format, sync::Arc, vec, vec::Vec};
 
 #[cfg(not(target_family = "wasm"))]
 mod lazy;
@@ -20,7 +20,7 @@ use cubecl_common::{
     backtrace::BackTrace,
     bytes::{AllocationProperty, Bytes},
     device::{Device, DeviceId},
-    device_handle::DeviceHandle,
+    device_handle::{DeviceGenerationId, DeviceHandle, DeviceLease},
     future::DynFut,
     profile::ProfileDuration,
 };
@@ -35,6 +35,7 @@ use cubecl_common::stream_id::StreamId;
 /// It should be obtained for a specific device via the Compute struct.
 pub struct ComputeClient<R: Runtime> {
     device: DeviceHandle<R::Server>,
+    lease: DeviceLease,
     utilities: Arc<ServerUtilities<R::Server>>,
     stream_id: Option<StreamId>,
 }
@@ -43,6 +44,7 @@ impl<R: Runtime> Clone for ComputeClient<R> {
     fn clone(&self) -> Self {
         Self {
             device: self.device.clone(),
+            lease: self.lease.clone(),
             utilities: self.utilities.clone(),
             stream_id: self.stream_id,
         }
@@ -60,9 +62,11 @@ impl<R: Runtime> ComputeClient<R> {
         let utilities = server.utilities();
         let context = DeviceHandle::<R::Server>::insert(device.to_id(), server)
             .expect("Can't create a new client on an already registered server");
+        let lease = context.lease();
 
         Self {
             device: context,
+            lease,
             utilities,
             stream_id: None,
         }
@@ -71,6 +75,7 @@ impl<R: Runtime> ComputeClient<R> {
     /// Load the client for the given device.
     pub fn load<D: Device>(device: &D) -> Self {
         let context = DeviceHandle::<R::Server>::new(device.to_id());
+        let lease = context.lease();
 
         // This is safe because we now know the return type of [`DeviceHandle::utilities()`].
         let utilities = context
@@ -80,6 +85,7 @@ impl<R: Runtime> ComputeClient<R> {
 
         Self {
             device: context,
+            lease,
             utilities,
             stream_id: None,
         }
@@ -92,6 +98,78 @@ impl<R: Runtime> ComputeClient<R> {
         }
     }
 
+    /// Returns the device-runner generation retained by this client, when applicable.
+    pub fn generation_id(&self) -> Option<DeviceGenerationId> {
+        self.lease.generation_id()
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn clone_lease(&self) -> DeviceLease {
+        self.lease.clone()
+    }
+
+    fn retain_future<T: Send + 'static>(&self, future: DynFut<T>) -> DynFut<T> {
+        let lease = self.lease.clone();
+        Box::pin(async move {
+            let _lease = lease;
+            future.await
+        })
+    }
+
+    fn retain_profile(&self, profile: ProfileDuration) -> ProfileDuration {
+        let method = profile.timing_method();
+        let lease = self.lease.clone();
+        ProfileDuration::new(
+            Box::pin(async move {
+                let _lease = lease;
+                profile.resolve().await
+            }),
+            method,
+        )
+    }
+
+    fn validate_generation(&self, actual: Option<DeviceGenerationId>) -> Result<(), ServerError> {
+        let expected = self.generation_id();
+        if let (Some(expected), Some(actual)) = (expected, actual)
+            && expected != actual
+        {
+            return Err(ServerError::Generic {
+                reason: format!(
+                    "Resource generation {actual:?} doesn't match client generation {expected:?}"
+                ),
+                backtrace: BackTrace::capture(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn accept_binding(&self, binding: &mut Binding) -> Result<(), ServerError> {
+        self.validate_generation(binding.generation_id())?;
+        binding.clear_lease();
+        Ok(())
+    }
+
+    fn accept_descriptor(&self, descriptor: &mut CopyDescriptor) -> Result<(), ServerError> {
+        self.accept_binding(&mut descriptor.handle)
+    }
+
+    fn accept_arguments(&self, arguments: &mut KernelArguments) -> Result<(), ServerError> {
+        for binding in &mut arguments.buffers {
+            self.accept_binding(binding)?;
+        }
+        for tensor_map in &mut arguments.tensor_maps {
+            self.accept_binding(&mut tensor_map.binding)?;
+        }
+        Ok(())
+    }
+
+    fn retain_layouts(&self, layouts: &mut [MemoryLayout]) {
+        for layout in layouts {
+            layout.memory.set_lease(self.lease.clone());
+        }
+    }
+
     /// Set the stream in which the current client is operating on.
     ///
     /// # Safety
@@ -101,11 +179,22 @@ impl<R: Runtime> ComputeClient<R> {
         self.stream_id = Some(stream_id);
     }
 
-    fn do_read(&self, descriptors: Vec<CopyDescriptor>) -> DynFut<Result<Vec<Bytes>, ServerError>> {
+    fn do_read(
+        &self,
+        mut descriptors: Vec<CopyDescriptor>,
+    ) -> DynFut<Result<Vec<Bytes>, ServerError>> {
+        for descriptor in &mut descriptors {
+            if let Err(err) = self.accept_descriptor(descriptor) {
+                return Box::pin(core::future::ready(Err(err)));
+            }
+        }
+
         let stream_id = self.stream_id();
-        self.device
+        let future = self
+            .device
             .submit_blocking(move |server| server.read(descriptors, stream_id))
-            .unwrap()
+            .unwrap();
+        self.retain_future(future)
     }
 
     /// Given bindings, returns owned resources as bytes.
@@ -206,6 +295,8 @@ impl<R: Runtime> ComputeClient<R> {
     /// The data reflects the device state at first access, so the buffer must not be mutated
     /// between this call and the first read.
     pub fn read_lazy(&self, descriptor: CopyDescriptor) -> Bytes {
+        self.validate_generation(descriptor.handle.generation_id())
+            .unwrap_or_else(|err| panic!("{err}"));
         let len = descriptor.shape.iter().product::<usize>() * descriptor.elem_size;
         let controller = lazy::LazyDeviceController::new(self.clone(), Arc::new(descriptor));
         // SAFETY: the controller materializes exactly `len` bytes on first access.
@@ -221,6 +312,8 @@ impl<R: Runtime> ComputeClient<R> {
         &self,
         descriptor: CopyDescriptor,
     ) -> impl Future<Output = Result<Bytes, ServerError>> + Send {
+        self.validate_generation(descriptor.handle.generation_id())
+            .unwrap_or_else(|err| panic!("{err}"));
         let len = descriptor.shape.iter().product::<usize>() * descriptor.elem_size;
         let controller = lazy::LazyDeviceController::new(self.clone(), Arc::new(descriptor));
         // SAFETY: the controller materializes exactly `len` bytes on first access.
@@ -250,11 +343,15 @@ impl<R: Runtime> ComputeClient<R> {
         ServerError,
     > {
         let stream_id = self.stream_id();
-        let binding = handle.binding();
+        let mut binding = handle.binding();
+        self.accept_binding(&mut binding)?;
 
-        self.device
+        let resource = self
+            .device
             .submit_blocking(move |state| state.get_resource(binding, stream_id))
-            .unwrap()
+            .unwrap()?;
+
+        Ok(resource.with_lease(self.lease.clone()))
     }
 
     fn do_create_from_slices(
@@ -263,7 +360,8 @@ impl<R: Runtime> ComputeClient<R> {
         slices: Vec<Vec<u8>>,
     ) -> Result<Vec<MemoryLayout>, IoError> {
         let stream_id = self.stream_id();
-        let (handle_base, layouts) = self.utilities.layout_policy.apply(stream_id, &descriptors);
+        let (handle_base, mut layouts) =
+            self.utilities.layout_policy.apply(stream_id, &descriptors);
 
         let descriptors = descriptors
             .into_iter()
@@ -288,6 +386,7 @@ impl<R: Runtime> ComputeClient<R> {
             server.write(descriptors, stream_id);
         });
 
+        self.retain_layouts(&mut layouts);
         Ok(layouts)
     }
 
@@ -297,7 +396,8 @@ impl<R: Runtime> ComputeClient<R> {
         data: Vec<Bytes>,
     ) -> Result<Vec<MemoryLayout>, IoError> {
         let stream_id = self.stream_id();
-        let (handle_base, layouts) = self.utilities.layout_policy.apply(stream_id, &descriptors);
+        let (handle_base, mut layouts) =
+            self.utilities.layout_policy.apply(stream_id, &descriptors);
 
         let descriptors = descriptors
             .into_iter()
@@ -322,6 +422,7 @@ impl<R: Runtime> ComputeClient<R> {
             server.write(descriptors, stream_id);
         });
 
+        self.retain_layouts(&mut layouts);
         Ok(layouts)
     }
 
@@ -503,13 +604,15 @@ impl<R: Runtime> ComputeClient<R> {
         descriptors: Vec<MemoryLayoutDescriptor>,
     ) -> Result<Vec<MemoryLayout>, IoError> {
         let stream_id = self.stream_id();
-        let (handle_base, layouts) = self.utilities.layout_policy.apply(stream_id, &descriptors);
+        let (handle_base, mut layouts) =
+            self.utilities.layout_policy.apply(stream_id, &descriptors);
 
         let (size, memory) = (handle_base.size(), handle_base.memory);
         self.device.submit(move |server| {
             server.initialize_memory(memory, size, stream_id);
         });
 
+        self.retain_layouts(&mut layouts);
         Ok(layouts)
     }
 
@@ -668,8 +771,12 @@ impl<R: Runtime> ComputeClient<R> {
         }
 
         let stream_id = self.stream_id();
-        let src = src.binding();
-        let dst = dst.binding();
+        let mut src = src.binding();
+        let mut dst = dst.binding();
+        self.accept_binding(&mut src)
+            .unwrap_or_else(|err| panic!("{err}"));
+        self.accept_binding(&mut dst)
+            .unwrap_or_else(|err| panic!("{err}"));
 
         self.ensure_init_collective(device_ids.clone());
 
@@ -689,7 +796,7 @@ impl<R: Runtime> ComputeClient<R> {
     )]
     pub fn to_client_tensor(
         &mut self,
-        src_descriptor: CopyDescriptor,
+        mut src_descriptor: CopyDescriptor,
         dst_server: &Self,
         dtype: ElemType,
     ) -> Handle {
@@ -700,8 +807,11 @@ impl<R: Runtime> ComputeClient<R> {
         let device_id_dst = dst_server.device.device_id();
 
         let mut dst_server = dst_server.clone();
-        let handle = Handle::new(stream_id_dst, src_descriptor.handle.size_in_used());
-        let handle_cloned = handle.clone();
+        self.accept_descriptor(&mut src_descriptor)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let mut handle = Handle::new(stream_id_dst, src_descriptor.handle.size_in_used());
+        let mut handle_cloned = handle.clone();
+        handle_cloned.clear_lease();
 
         let device_ids = vec![device_id_src, device_id_dst];
         self.ensure_init_collective(device_ids.clone());
@@ -726,6 +836,7 @@ impl<R: Runtime> ComputeClient<R> {
         self.device.flush_queue();
         dst_server.device.flush_queue();
 
+        handle.set_lease(dst_server.lease.clone());
         handle
     }
 
@@ -741,7 +852,7 @@ impl<R: Runtime> ComputeClient<R> {
         &self,
         kernel: <R::Server as ComputeServer>::Kernel,
         count: CubeCount,
-        bindings: KernelArguments,
+        mut bindings: KernelArguments,
         mode: ExecutionMode,
         stream_id: StreamId,
     ) {
@@ -751,6 +862,9 @@ impl<R: Runtime> ComputeClient<R> {
         {
             return;
         }
+
+        self.accept_arguments(&mut bindings)
+            .unwrap_or_else(|err| panic!("{err}"));
 
         let level = self.utilities.logger.profile_level();
 
@@ -868,12 +982,18 @@ impl<R: Runtime> ComputeClient<R> {
 
         self.utilities.logger.profile_summary();
 
-        fut
+        self.retain_future(fut)
     }
 
     /// Get the features supported by the compute server.
     pub fn properties(&self) -> &DeviceProperties {
         &self.utilities.properties
+    }
+
+    /// Returns a lease-free context for a queued kernel compilation.
+    #[doc(hidden)]
+    pub fn kernel_compilation_context(&self) -> KernelCompilationContext<R> {
+        KernelCompilationContext::new(Arc::clone(&self.utilities.properties))
     }
 
     /// Get the features supported by the compute server.
@@ -885,7 +1005,7 @@ impl<R: Runtime> ComputeClient<R> {
     ///
     /// For private use only.
     pub fn properties_mut(&mut self) -> Option<&mut DeviceProperties> {
-        Arc::get_mut(&mut self.utilities).map(|state| &mut state.properties)
+        Arc::get_mut(&mut self.utilities).and_then(|state| Arc::get_mut(&mut state.properties))
     }
 
     /// Total memory usage across all streams on this client's device.
@@ -1055,7 +1175,7 @@ impl<R: Runtime> ComputeClient<R> {
             });
         }
 
-        result
+        result.map(|(output, profile)| (output, self.retain_profile(profile)))
     }
 
     /// Transfer data from one client to another
@@ -1068,26 +1188,29 @@ impl<R: Runtime> ComputeClient<R> {
     )]
     fn change_client_sync(
         &self,
-        src_descriptor: CopyDescriptor,
+        mut src_descriptor: CopyDescriptor,
         alloc_descriptor: MemoryLayoutDescriptor,
         dst_server: &Self,
     ) -> MemoryLayout {
         let shape = src_descriptor.shape.clone();
         let elem_size = src_descriptor.elem_size;
-        let stream_id = self.stream_id();
+        let stream_id_src = self.stream_id();
+        let stream_id_dst = dst_server.stream_id();
+        self.accept_descriptor(&mut src_descriptor)
+            .unwrap_or_else(|err| panic!("{err}"));
 
         let read = self
             .device
-            .submit_blocking(move |server| server.read(vec![src_descriptor], stream_id))
+            .submit_blocking(move |server| server.read(vec![src_descriptor], stream_id_src))
             .unwrap();
 
         let mut data = cubecl_common::future::block_on(read).unwrap();
 
-        let (handle_base, mut layouts) = self
+        let (handle_base, mut layouts) = dst_server
             .utilities
             .layout_policy
-            .apply(stream_id, &[alloc_descriptor]);
-        let alloc = layouts.remove(0);
+            .apply(stream_id_dst, &[alloc_descriptor]);
+        let mut alloc = layouts.remove(0);
 
         let desc_descriptor = CopyDescriptor {
             handle: handle_base.clone().binding(),
@@ -1098,10 +1221,11 @@ impl<R: Runtime> ComputeClient<R> {
 
         let (size, memory) = (handle_base.size(), handle_base.memory);
         dst_server.device.submit(move |server| {
-            server.initialize_memory(memory, size, stream_id);
-            server.write(vec![(desc_descriptor, data.remove(0))], stream_id)
+            server.initialize_memory(memory, size, stream_id_dst);
+            server.write(vec![(desc_descriptor, data.remove(0))], stream_id_dst)
         });
 
+        alloc.memory.set_lease(dst_server.lease.clone());
         alloc
     }
 

@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 use cubecl_common::{
     backtrace::BackTrace,
     bytes::Bytes,
+    future,
     profile::{ProfileDuration, TimingMethod},
     stream_id::StreamId,
 };
@@ -77,6 +78,18 @@ impl<C: WgpuCompiler> ServerCommunication for WgpuServer<C> {
 }
 
 impl<C: WgpuCompiler> WgpuServer<C> {
+    /// Submits and waits for all work owned by this server.
+    pub(crate) fn shutdown(&mut self) -> Result<(), ServerError> {
+        let stream_ids = self.scheduler.stream_ids().collect::<Vec<_>>();
+        self.scheduler.execute_streams(stream_ids.clone());
+
+        for stream_id in stream_ids {
+            future::block_on(self.scheduler.stream(&stream_id).sync())?;
+        }
+
+        Ok(())
+    }
+
     /// Create a new server.
     #[allow(clippy::too_many_arguments)]
     pub fn new(

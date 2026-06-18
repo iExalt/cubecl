@@ -85,7 +85,7 @@ pub struct ServerUtilities<Server: ComputeServer> {
     #[cfg(feature = "profile-tracy")]
     pub gpu_client: tracy_client::GpuContext,
     /// Information shared between all servers.
-    pub properties: DeviceProperties,
+    pub properties: Arc<DeviceProperties>,
     /// Stable hash of the device properties
     pub properties_hash: u64,
     /// Information specific to the current server.
@@ -141,7 +141,7 @@ impl<S: ComputeServer> ServerUtilities<S> {
 
         Self {
             properties_hash: properties.checksum(),
-            properties,
+            properties: Arc::new(properties),
             logger,
             // Create the GPU client if needed.
             #[cfg(feature = "profile-tracy")]

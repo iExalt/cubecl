@@ -1,7 +1,9 @@
 use crate::{
     device::{
         DeviceId, DeviceService,
-        handle::{CallError, DeviceHandleSpec, ServerUtilitiesHandle, ServiceCreationError},
+        handle::{
+            CallError, DeviceHandleSpec, DeviceLease, ServerUtilitiesHandle, ServiceCreationError,
+        },
     },
     stream_id::StreamId,
     stub::{Arc, Mutex, RwLock},
@@ -78,6 +80,10 @@ impl<S: DeviceService + 'static> DeviceHandleSpec<S> for MutexDeviceHandle<S> {
 
     fn utilities(&self) -> ServerUtilitiesHandle {
         self.state.utilities.clone()
+    }
+
+    fn lease(&self) -> DeviceLease {
+        DeviceLease::stateless()
     }
 
     fn flush_queue(&self) {}

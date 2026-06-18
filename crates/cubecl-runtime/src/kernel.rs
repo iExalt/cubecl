@@ -1,6 +1,7 @@
 use alloc::{
     boxed::Box,
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 use core::{
@@ -10,15 +11,37 @@ use core::{
 };
 
 use cubecl_common::format::format_str;
-use cubecl_ir::{Id, Scope, StorageType, Value};
+use cubecl_ir::{DeviceProperties, Id, Scope, StorageType, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     compiler::{CompilationError, Compiler, CubeTask},
     config::{CubeClRuntimeConfig, RuntimeConfig, compilation::CompilationLogLevel},
     id::KernelId,
+    runtime::Runtime,
     server::{CubeDim, ExecutionMode},
 };
+
+/// Lease-free context retained by a kernel while it waits for compilation.
+#[doc(hidden)]
+pub struct KernelCompilationContext<R: Runtime> {
+    properties: Arc<DeviceProperties>,
+    runtime: PhantomData<R>,
+}
+
+impl<R: Runtime> KernelCompilationContext<R> {
+    pub(crate) fn new(properties: Arc<DeviceProperties>) -> Self {
+        Self {
+            properties,
+            runtime: PhantomData,
+        }
+    }
+
+    /// Returns the immutable properties used to define the kernel.
+    pub fn properties(&self) -> &DeviceProperties {
+        &self.properties
+    }
+}
 
 /// Implement this trait to create a [kernel definition](KernelDefinition).
 pub trait KernelMetadata: Send + Sync + 'static {

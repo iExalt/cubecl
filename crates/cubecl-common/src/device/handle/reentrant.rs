@@ -8,7 +8,9 @@ use hashbrown::HashMap;
 use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
 use std::sync::Arc;
 
-use crate::device::handle::{DeviceHandleSpec, ServerUtilitiesHandle, ServiceCreationError};
+use crate::device::handle::{
+    DeviceHandleSpec, DeviceLease, ServerUtilitiesHandle, ServiceCreationError,
+};
 use crate::device::{DeviceId, DeviceService};
 
 /// Handle for accessing a [`DeviceState`] associated with a specific device.
@@ -44,6 +46,10 @@ impl<S: DeviceService> DeviceHandleSpec<S> for ReentrantMutexDeviceHandle<S> {
             .expect("Service not yet initialized — call init() before load()")
             .utilities
             .clone()
+    }
+
+    fn lease(&self) -> DeviceLease {
+        DeviceLease::stateless()
     }
 
     fn flush_queue(&self) {}

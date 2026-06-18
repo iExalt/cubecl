@@ -209,6 +209,12 @@ impl DeviceService for HipServer {
     fn utilities(&self) -> ServerUtilitiesHandle {
         self.utilities() as ServerUtilitiesHandle
     }
+
+    fn shutdown(&mut self) {
+        if let Err(status) = self.shutdown() {
+            log::warn!("Unable to synchronize HIP during shutdown: status {status}");
+        }
+    }
 }
 
 impl Runtime for HipRuntime {

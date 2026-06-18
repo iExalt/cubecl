@@ -236,7 +236,7 @@ impl Launch {
         quote! {
             let mut builder = #kernel_builder::default();
             builder.runtime_properties(__R::target_properties());
-            builder.device_properties(self.client.properties());
+            builder.device_properties(self.context.properties());
 
             #register_type
             self.settings.address_type.register(&mut builder.scope);
@@ -352,6 +352,7 @@ impl Launch {
             let cube_kernel = prelude_type("CubeKernel");
             let kernel_settings = prelude_type("KernelSettings");
             let compute_client = prelude_type("ComputeClient");
+            let kernel_compilation_context = prelude_type("KernelCompilationContext");
             let kernel_definition: syn::Path = prelude_type("KernelDefinition");
             let kernel_id = prelude_type("KernelId");
             let storage_ty = prelude_type("StorageType");
@@ -391,7 +392,7 @@ impl Launch {
                 #[doc = #kernel_doc]
                 pub struct #kernel_name #generics #where_clause {
                     settings: #kernel_settings,
-                    client: #compute_client<__R>,
+                    context: #kernel_compilation_context<__R>,
                     #(#compilation_args,)*
                     #(#const_params,)*
                     #phantom_data
@@ -406,9 +407,10 @@ impl Launch {
                         client: #compute_client<__R>,
                         #(#compilation_args,)*
                         #(#const_params),*) -> Self {
+                        let context = client.kernel_compilation_context();
                         Self {
                             settings: #settings,
-                            client,
+                            context,
                             #(#args,)*
                             #(#param_names,)*
                             #phantom_data_init

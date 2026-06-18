@@ -6,7 +6,7 @@ mod _impl {
     pub struct WgpuPoll {
         active_handle: std::sync::Arc<()>,
         cancel_sender: std::sync::mpsc::Sender<()>,
-        poll_thread: JoinHandle<()>,
+        poll_thread: Option<JoinHandle<()>>,
     }
 
     impl WgpuPoll {
@@ -43,23 +43,37 @@ mod _impl {
             Self {
                 active_handle,
                 cancel_sender,
-                poll_thread,
+                poll_thread: Some(poll_thread),
             }
         }
         /// Get a handle, as long as it's alive the polling will be active.
         pub fn start_polling(&self) -> std::sync::Arc<()> {
             let handle = self.active_handle.clone();
-            self.poll_thread.thread().unpark();
+            if let Some(poll_thread) = &self.poll_thread {
+                poll_thread.thread().unpark();
+            }
             handle
+        }
+
+        /// Stops and joins the polling thread.
+        pub fn shutdown(&mut self) {
+            let Some(poll_thread) = self.poll_thread.take() else {
+                return;
+            };
+
+            if self.cancel_sender.send(()).is_err() {
+                log::warn!("wgpu polling thread exited before shutdown");
+            }
+            poll_thread.thread().unpark();
+            if poll_thread.join().is_err() {
+                log::warn!("wgpu polling thread panicked during shutdown");
+            }
         }
     }
 
     impl Drop for WgpuPoll {
         fn drop(&mut self) {
-            self.cancel_sender
-                .send(())
-                .expect("Failed to shutdown polling thread.");
-            self.poll_thread.thread().unpark();
+            self.shutdown();
         }
     }
 }
@@ -76,6 +90,7 @@ mod _impl {
         pub fn start_polling(&self) -> alloc::sync::Arc<()> {
             alloc::sync::Arc::new(())
         }
+        pub fn shutdown(&mut self) {}
     }
 }
 
