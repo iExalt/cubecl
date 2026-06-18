@@ -191,6 +191,11 @@ impl std::error::Error for RuntimeGuardError {}
 /// Acquire this guard before creating runtime clients. Values created after the
 /// guard are dropped first when the surrounding scope exits, allowing the guard
 /// to join device runners before process teardown begins.
+///
+/// Shutdown force-closes every registered runtime generation. The guard must be
+/// the sole process owner of the runtime, and every client and resource must be
+/// dropped before the guard. Values retained past shutdown are invalid and are
+/// rejected if reused.
 #[must_use = "the runtime guard must remain alive while CubeCL clients are in use"]
 pub struct RuntimeGuard {
     active: bool,
@@ -210,9 +215,11 @@ impl RuntimeGuard {
         Ok(Self { active: true })
     }
 
-    /// Shuts down all device services and releases the guard.
+    /// Force-closes all device services and releases the guard.
     ///
-    /// Call this after dropping all `CubeCL` clients and backend-owned values.
+    /// Call this only with sole process ownership after dropping all `CubeCL`
+    /// clients and backend-owned values. Any retained values are invalidated and
+    /// are rejected if reused.
     ///
     /// # Errors
     ///
@@ -244,10 +251,12 @@ impl Drop for RuntimeGuard {
     }
 }
 
-/// Shuts down and joins every process-wide `CubeCL` device service.
+/// Force-closes and joins every process-wide `CubeCL` device service.
 ///
-/// Callers must stop creating clients and submitting work before calling this
-/// function. A new runtime generation may be initialized after it returns.
+/// This function requires sole process ownership of the runtime. Callers must
+/// stop creating clients and submitting work, then drop every client and
+/// resource before calling it. Retained values are invalidated and are rejected
+/// if reused. A new runtime generation may be initialized after it returns.
 ///
 /// # Errors
 ///

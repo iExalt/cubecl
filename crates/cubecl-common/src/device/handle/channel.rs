@@ -454,6 +454,11 @@ impl Drop for ShutdownPermit {
 ///
 /// Runners are shut down upstream-first so accepted producer work is drained
 /// before downstream services are closed.
+///
+/// This force-closes every registered runtime generation, even when external
+/// clients or resources remain alive. Callers must have sole process ownership
+/// of the runtime and stop creating or using runtime values before shutdown.
+/// Values from a closed generation are invalid and are rejected if reused.
 pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
     let permit = ShutdownPermit::acquire();
     let mut runner_panics = 0;
@@ -1057,6 +1062,9 @@ mod custom_channel {
         closed: Condvar,
         join_handle: Mutex<Option<JoinHandle<()>>>,
         join_delegated: AtomicBool,
+        runner_close_fallback: AtomicBool,
+        #[cfg(test)]
+        fail_delegate_join_spawn: AtomicBool,
     }
 
     impl RuntimeGeneration {
@@ -1077,6 +1085,9 @@ mod custom_channel {
                 closed: Condvar::new(),
                 join_handle: Mutex::new(None),
                 join_delegated: AtomicBool::new(false),
+                runner_close_fallback: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_delegate_join_spawn: AtomicBool::new(false),
             });
             CREATED_GENERATIONS.fetch_add(1, Ordering::Relaxed);
             generation
@@ -1198,6 +1209,19 @@ mod custom_channel {
             }
 
             let runner_id = generation.runner_id;
+
+            #[cfg(test)]
+            if generation
+                .fail_delegate_join_spawn
+                .swap(false, Ordering::AcqRel)
+            {
+                generation
+                    .runner_close_fallback
+                    .store(true, Ordering::Release);
+                generation.join_delegated.store(false, Ordering::Release);
+                return;
+            }
+
             let join_generation = Arc::clone(generation);
             let result = std::thread::Builder::new()
                 .name(std::format!(
@@ -1215,9 +1239,13 @@ mod custom_channel {
                 });
 
             if let Err(err) = result {
+                generation
+                    .runner_close_fallback
+                    .store(true, Ordering::Release);
                 generation.join_delegated.store(false, Ordering::Release);
                 // The runner still owns an internal reference and will quiesce itself. Keep the
-                // join handle available in case another off-runner closer arrives.
+                // join handle available in case another off-runner closer arrives. Otherwise the
+                // runner marks itself closed after service shutdown.
                 log::warn!(
                     "Failed to spawn joiner for device runner {:?}: {err}",
                     runner_id
@@ -1228,6 +1256,7 @@ mod custom_channel {
         fn join_runner(&self) -> Result<(), ()> {
             let join_handle = self.join_handle.lock().unwrap().take();
             if let Some(join_handle) = join_handle {
+                self.runner_close_fallback.store(false, Ordering::Release);
                 let panicked = join_handle.join().is_err();
                 self.mark_closed(panicked);
             } else {
@@ -1248,6 +1277,11 @@ mod custom_channel {
         #[cfg(test)]
         fn status(&self) -> GenerationStatus {
             self.lifecycle.lock().unwrap().status
+        }
+
+        #[cfg(test)]
+        fn fail_next_delegate_join_spawn(&self) {
+            self.fail_delegate_join_spawn.store(true, Ordering::Release);
         }
     }
 
@@ -1400,6 +1434,11 @@ mod custom_channel {
             self.lease.generation().status()
         }
 
+        #[cfg(test)]
+        pub fn fail_next_delegate_join_spawn(&self) {
+            self.lease.generation().fail_next_delegate_join_spawn();
+        }
+
         /// Creates a new channel and spawns a server thread to process it.
         pub fn new<I, S>(runner_id: RunnerId, init: I, shutdown: S) -> Self
         where
@@ -1432,6 +1471,13 @@ mod custom_channel {
                         shutdown();
                     }));
                     core::mem::drop(runner_reference);
+
+                    if runner_generation
+                        .runner_close_fallback
+                        .load(Ordering::Acquire)
+                    {
+                        runner_generation.mark_closed(result.is_err());
+                    }
 
                     if let Err(err) = result {
                         resume_unwind(err);
@@ -1696,7 +1742,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // A mock service to track state changes and initialization
     struct MockService {
@@ -2783,6 +2829,44 @@ mod tests {
         shutdown_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("service shutdown should run after the task releases its borrow");
+    }
+
+    #[test]
+    fn test_delegate_join_spawn_failure_closes_generation_and_allows_replacement() {
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 111,
+        };
+        let handle = ChannelDeviceHandle::<MockService>::new(device_id);
+        let generation_id = handle.state.client.generation_id();
+        handle.state.client.fail_next_delegate_join_spawn();
+        let shutdown_client = handle.state.client.clone();
+
+        handle.submit(move |_| shutdown_client.shutdown().unwrap());
+        handle.flush_queue();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while handle.state.client.generation_status() != custom_channel::GenerationStatus::Closed {
+            assert!(
+                Instant::now() < deadline,
+                "runner should mark the generation closed when delegated join cannot start"
+            );
+            std::thread::yield_now();
+        }
+
+        let (replacement_tx, replacement_rx) = mpsc::channel();
+        let replacement_thread = std::thread::spawn(move || {
+            replacement_tx
+                .send(ChannelDeviceHandle::<MockService>::new(device_id))
+                .unwrap();
+        });
+        let replacement = replacement_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement generation should not wait for a missing joiner");
+        replacement_thread.join().unwrap();
+        assert_ne!(generation_id, replacement.state.client.generation_id());
+
+        drop((handle, replacement));
     }
 
     #[test]
