@@ -1,6 +1,7 @@
 use crate::memory_management::MemoryHandle;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
+use cubecl_common::device_handle::{DeviceGenerationId, DeviceLease};
 
 /// Managed Memory handle
 #[derive(Debug)]
@@ -14,6 +15,7 @@ pub struct ManagedMemoryHandle {
 #[derive(Debug)]
 pub struct ManagedMemoryBinding {
     descriptor: Arc<ManagedMemoryDescriptor>,
+    lease: Option<DeviceLease>,
 }
 
 /// A list of bindings that are shared across multiple streams.
@@ -214,6 +216,7 @@ impl ManagedMemoryHandle {
     pub fn binding(self) -> ManagedMemoryBinding {
         ManagedMemoryBinding {
             descriptor: self.descriptor.clone(),
+            lease: None,
         }
     }
 
@@ -239,6 +242,19 @@ impl ManagedMemoryBinding {
     pub fn id(&self) -> ManagedMemoryId {
         self.descriptor.id
     }
+
+    /// Returns the device-runner generation retained by this binding, when applicable.
+    pub fn generation_id(&self) -> Option<DeviceGenerationId> {
+        self.lease.as_ref().and_then(DeviceLease::generation_id)
+    }
+
+    pub(crate) fn set_lease(&mut self, lease: Option<DeviceLease>) {
+        self.lease = lease;
+    }
+
+    pub(crate) fn clear_lease(&mut self) {
+        self.lease = None;
+    }
 }
 
 impl Default for ManagedMemoryHandle {
@@ -251,6 +267,7 @@ impl Clone for ManagedMemoryBinding {
     fn clone(&self) -> Self {
         Self {
             descriptor: self.descriptor.clone(),
+            lease: self.lease.clone(),
         }
     }
 }

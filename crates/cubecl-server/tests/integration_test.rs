@@ -3,13 +3,154 @@ mod dummy;
 use crate::dummy::{DummyDevice, DummyElementwiseAddition, test_client};
 
 use cubecl_common::bytes::Bytes;
-use cubecl_common::device::{DeviceId, ServiceId};
+use cubecl_common::device::{Device, DeviceId, ServiceId};
 use cubecl_environment::stream::StreamId;
 use cubecl_ir::{ElemType, UIntKind};
+use cubecl_runtime::lifecycle::RuntimeSession;
 use cubecl_server::client::Client;
 use cubecl_server::server::{CubeCount, Handle, KernelArguments, ServerError};
 use cubecl_server::{local_tuner, tune::LocalTuner};
 use dummy::*;
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+struct IndexedDummyDevice(u16);
+
+impl Device for IndexedDummyDevice {
+    fn from_id(device_id: DeviceId) -> Self {
+        Self(device_id.index_id)
+    }
+
+    fn to_id(&self) -> DeviceId {
+        DeviceId {
+            type_id: 0,
+            index_id: self.0,
+        }
+    }
+}
+
+#[test_log::test]
+#[serial_test::serial]
+fn resource_generation_is_retained_and_validated() {
+    let client_a = Client::load::<DummyServer>(IndexedDummyDevice(101).to_id());
+    let client_b = Client::load::<DummyServer>(IndexedDummyDevice(102).to_id());
+    let generation_a = client_a.generation_id().unwrap();
+    let generation_b = client_b.generation_id().unwrap();
+    assert_ne!(generation_a, generation_b);
+
+    let handle = client_a.empty(4);
+    let binding = handle.clone().binding();
+    let layout = client_a.empty_tensor([4].into(), 1);
+    let resource = client_a
+        .get_resource::<DummyServer>(handle.clone())
+        .unwrap();
+    assert_eq!(handle.generation_id(), Some(generation_a));
+    assert_eq!(binding.generation_id(), Some(generation_a));
+    assert_eq!(layout.memory.generation_id(), Some(generation_a));
+    assert_eq!(resource.generation_id(), Some(generation_a));
+
+    assert!(client_a.read_one(handle.clone()).is_ok());
+
+    let read_error =
+        cubecl_environment::future::block_on(client_b.read_async(vec![handle.clone()]))
+            .unwrap_err();
+    assert!(format!("{read_error}").contains("doesn't match client generation"));
+    assert!(
+        client_b
+            .get_resource::<DummyServer>(handle.clone())
+            .is_err()
+    );
+
+    let launch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client_b.launch(
+            Box::new(KernelTask::new(DummyElementwiseAddition)),
+            CubeCount::Static(1, 1, 1),
+            KernelArguments::new().with_buffer(handle.binding()),
+        );
+    }));
+    assert!(launch.is_err());
+
+    let unbound = Handle::new(
+        ServiceId::of::<DummyServer>(DeviceId::new(0, 103)),
+        StreamId::current(),
+        4,
+    );
+    assert_eq!(unbound.generation_id(), None);
+}
+
+#[test_log::test]
+#[serial_test::serial]
+fn escaping_read_keeps_the_generation_alive() {
+    let device_id = DeviceId::new(0, 104);
+    let client = Client::load::<DummyServer>(device_id);
+    let generation = client.generation_id().unwrap();
+    let handle = client.create_from_slice(&[1, 2, 3]);
+    let read = client.read_async(vec![handle]);
+    drop(client);
+
+    let reacquired = Client::load::<DummyServer>(device_id);
+    assert_eq!(reacquired.generation_id(), Some(generation));
+    drop(reacquired);
+
+    assert_eq!(
+        cubecl_environment::future::block_on(read).unwrap()[0].to_vec(),
+        [1, 2, 3]
+    );
+
+    let replacement = Client::load::<DummyServer>(device_id);
+    assert_ne!(replacement.generation_id(), Some(generation));
+}
+
+#[test_log::test]
+#[serial_test::serial]
+fn escaping_profile_keeps_the_generation_alive() {
+    let device_id = DeviceId::new(0, 105);
+    let client = Client::load::<DummyServer>(device_id);
+    let generation = client.generation_id().unwrap();
+    let profile = client.profile(|| (), "lease-profile").unwrap().1;
+    drop(client);
+
+    let reacquired = Client::load::<DummyServer>(device_id);
+    assert_eq!(reacquired.generation_id(), Some(generation));
+    drop(reacquired);
+
+    assert!(cubecl_environment::future::block_on(profile.into_future()).is_some());
+
+    let replacement = Client::load::<DummyServer>(device_id);
+    assert_ne!(replacement.generation_id(), Some(generation));
+}
+
+#[test_log::test]
+#[serial_test::serial]
+fn runtime_session_deduplicates_and_reports_shared_generation() {
+    let mut session = RuntimeSession::new();
+    let client = session.client::<DummyRuntime>(&DummyDevice);
+
+    assert_eq!(session.num_pinned_generations(), 1);
+    assert!(!session.pin(&client));
+    assert_eq!(session.num_pinned_generations(), 1);
+
+    let report = session.shutdown().unwrap();
+    assert_eq!(report.closed_generations(), 0);
+    assert_eq!(report.closing_generations(), 0);
+    assert_eq!(report.shared_generations(), 1);
+    assert_eq!(report.stateless_leases(), 0);
+
+    drop(client);
+}
+
+#[test_log::test]
+#[serial_test::serial]
+fn runtime_session_final_pin_closes_generation() {
+    let mut session = RuntimeSession::new();
+    let client = Client::load::<DummyServer>(DeviceId::new(0, 103));
+    assert!(session.pin(&client));
+    drop(client);
+
+    let report = session.shutdown().unwrap();
+    assert_eq!(report.closed_generations(), 1);
+    assert_eq!(report.closing_generations(), 0);
+    assert_eq!(report.shared_generations(), 0);
+}
 
 #[test_log::test]
 fn created_resource_is_the_same_when_read() {

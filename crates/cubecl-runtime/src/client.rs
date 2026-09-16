@@ -26,7 +26,7 @@ mod lazy;
 use cubecl_common::{
     bytes::{AllocationProperty, Bytes},
     device::{DeviceId, ServiceId},
-    device_handle::{CallResultExt, DeviceHandle},
+    device_handle::{CallResultExt, DeviceGenerationId, DeviceHandle, DeviceLease},
     profile::ProfileDuration,
 };
 use cubecl_environment::backtrace::BackTrace;
@@ -42,6 +42,7 @@ use cubecl_environment::stream::StreamId;
 /// It should be obtained for a specific device via the Compute struct.
 pub struct Client {
     device: DeviceHandle<dyn Server>,
+    lease: DeviceLease,
     utilities: Arc<ServerUtilities>,
     stream_id: Option<StreamId>,
 }
@@ -177,6 +178,7 @@ impl Clone for Client {
     fn clone(&self) -> Self {
         Self {
             device: self.device.clone(),
+            lease: self.lease.clone(),
             utilities: self.utilities.clone(),
             stream_id: self.stream_id,
         }
@@ -195,9 +197,11 @@ impl Client {
         let context = DeviceHandle::<S>::insert(device_id, server)
             .expect("Can't create a new client on an already registered server")
             .seen_as(as_server::<S>);
+        let lease = context.lease();
 
         Self {
             device: context,
+            lease,
             utilities,
             stream_id: None,
         }
@@ -207,6 +211,7 @@ impl Client {
     /// there if none runs yet.
     pub fn load<S: ServerStorage>(device_id: DeviceId) -> Self {
         let context = DeviceHandle::<S>::new(device_id).seen_as(as_server::<S>);
+        let lease = context.lease();
 
         // This is safe because we now know the return type of [`DeviceHandle::utilities()`].
         let utilities = context
@@ -216,6 +221,7 @@ impl Client {
 
         Self {
             device: context,
+            lease,
             utilities,
             stream_id: None,
         }
@@ -225,6 +231,77 @@ impl Client {
         match self.stream_id {
             Some(val) => val,
             None => StreamId::current(),
+        }
+    }
+
+    /// Returns the device-runner generation retained by this client, when applicable.
+    pub fn generation_id(&self) -> Option<DeviceGenerationId> {
+        self.lease.generation_id()
+    }
+
+    pub(crate) fn clone_lease(&self) -> DeviceLease {
+        self.lease.clone()
+    }
+
+    fn retain_future<T: Send + 'static>(&self, future: DynFut<T>) -> DynFut<T> {
+        let lease = self.lease.clone();
+        Box::pin(async move {
+            let _lease = lease;
+            future.await
+        })
+    }
+
+    fn retain_profile(&self, profile: ProfileDuration) -> ProfileDuration {
+        let method = profile.timing_method();
+        let lease = self.lease.clone();
+        ProfileDuration::new(
+            Box::pin(async move {
+                let _lease = lease;
+                profile.into_future().await
+            }),
+            method,
+        )
+    }
+
+    fn validate_generation(&self, actual: Option<DeviceGenerationId>) -> Result<(), ServerError> {
+        let expected = self.generation_id();
+        if let (Some(expected), Some(actual)) = (expected, actual)
+            && expected != actual
+        {
+            return Err(ServerError::Generic {
+                reason: format!(
+                    "Resource generation {actual:?} doesn't match client generation {expected:?}"
+                ),
+                backtrace: BackTrace::capture(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn accept_binding(&self, binding: &mut BufferBinding) -> Result<(), ServerError> {
+        self.validate_generation(binding.generation_id())?;
+        binding.clear_lease();
+        Ok(())
+    }
+
+    fn accept_descriptor(&self, descriptor: &mut CopyDescriptor) -> Result<(), ServerError> {
+        self.accept_binding(&mut descriptor.handle)
+    }
+
+    fn accept_arguments(&self, arguments: &mut KernelArguments) -> Result<(), ServerError> {
+        for resource in &mut arguments.resources {
+            match resource {
+                KernelResource::Buffer(binding) => self.accept_binding(binding)?,
+                KernelResource::TensorMap(map) => self.accept_binding(&mut map.binding)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn retain_layouts(&self, layouts: &mut [MemoryLayout]) {
+        for layout in layouts {
+            layout.memory.set_lease(self.lease.clone());
         }
     }
 
@@ -275,23 +352,28 @@ impl Client {
     }
 
     fn do_read(&self, descriptors: Vec<CopyDescriptor>) -> DynFut<Result<Vec<Bytes>, ServerError>> {
-        if let Some(err) = descriptors
-            .iter()
-            .find_map(|descriptor| self.local(&descriptor.handle).err())
-        {
-            return Box::pin(core::future::ready(Err(err)));
+        let mut descriptors = descriptors;
+        for descriptor in &mut descriptors {
+            if let Err(err) = self.accept_descriptor(descriptor) {
+                return Box::pin(core::future::ready(Err(err)));
+            }
+            if let Err(err) = self.local(&descriptor.handle) {
+                return Box::pin(core::future::ready(Err(err)));
+            }
         }
         let stream_id = self.stream_id();
-        self.device
+        let future = self
+            .device
             .submit_blocking(move |server| server.read(descriptors, stream_id))
-            .unwrap_or_resume()
+            .unwrap_or_resume();
+        self.retain_future(future)
     }
 
     /// Given bindings, returns owned resources as bytes.
     pub fn read_async(
         &self,
         handles: Vec<Handle>,
-    ) -> impl Future<Output = Result<Vec<Bytes>, ServerError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>, ServerError>> + Send + use<> {
         let shapes = handles
             .iter()
             .map(|it| [it.size_in_used() as usize].into())
@@ -334,7 +416,7 @@ impl Client {
     pub fn read_tensor_async(
         &self,
         descriptors: Vec<CopyDescriptor>,
-    ) -> impl Future<Output = Result<Vec<Bytes>, ServerError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Bytes>, ServerError>> + Send + use<> {
         self.do_read(descriptors)
     }
 
@@ -360,7 +442,7 @@ impl Client {
     pub fn read_one_tensor_async(
         &self,
         descriptor: CopyDescriptor,
-    ) -> impl Future<Output = Result<Bytes, ServerError>> + Send {
+    ) -> impl Future<Output = Result<Bytes, ServerError>> + Send + use<> {
         let fut = self.read_tensor_async(vec![descriptor]);
 
         async { Ok(fut.await?.remove(0)) }
@@ -387,6 +469,8 @@ impl Client {
     /// between this call and the first read.
     #[cfg(not(target_family = "wasm"))]
     pub fn read_lazy(&self, descriptor: CopyDescriptor) -> Bytes {
+        self.validate_generation(descriptor.handle.generation_id())
+            .unwrap_or_else(|err| panic!("{err}"));
         self.expect_local(&descriptor.handle);
         let len = descriptor.shape.iter().product::<usize>() * descriptor.elem_size;
         let controller = lazy::LazyDeviceController::new(self.clone(), Arc::new(descriptor));
@@ -402,7 +486,10 @@ impl Client {
     pub fn read_lazy_async(
         &self,
         descriptor: CopyDescriptor,
-    ) -> impl Future<Output = Result<Bytes, ServerError>> + Send {
+    ) -> impl Future<Output = Result<Bytes, ServerError>> + Send + use<> {
+        if let Err(err) = self.validate_generation(descriptor.handle.generation_id()) {
+            return core::future::ready(Err(err));
+        }
         if let Err(err) = self.local(&descriptor.handle) {
             return core::future::ready(Err(err));
         }
@@ -422,7 +509,7 @@ impl Client {
     pub fn read_lazy_async(
         &self,
         descriptor: CopyDescriptor,
-    ) -> impl Future<Output = Result<Bytes, ServerError>> + Send {
+    ) -> impl Future<Output = Result<Bytes, ServerError>> + Send + use<> {
         self.read_one_tensor_async(descriptor)
     }
 
@@ -432,7 +519,8 @@ impl Client {
         handle: Handle,
     ) -> Result<ManagedResource<<S::Storage as ComputeStorage>::Resource>, ServerError> {
         let stream_id = self.stream_id();
-        let binding = handle.binding();
+        let mut binding = handle.binding();
+        self.accept_binding(&mut binding)?;
         self.local(&binding)?;
         if !self.is_service::<S>() {
             return Err(ServerError::ServiceMismatch {
@@ -442,14 +530,17 @@ impl Client {
             });
         }
 
-        self.device
+        let resource = self
+            .device
             .submit_blocking(move |server| {
                 let server = (server as &mut dyn Any)
                     .downcast_mut::<S>()
                     .expect("is_service passed, so this is the server's type");
                 server.get_resource(binding, stream_id)
             })
-            .unwrap_or_resume()
+            .unwrap_or_resume()?;
+
+        Ok(resource.with_lease(self.lease.clone()))
     }
 
     fn do_create_from_slices(
@@ -458,7 +549,7 @@ impl Client {
         slices: Vec<Vec<u8>>,
     ) -> Vec<MemoryLayout> {
         let stream_id = self.stream_id();
-        let (handle_base, layouts) =
+        let (handle_base, mut layouts) =
             self.utilities
                 .layout_policy
                 .apply(self.service_id(), stream_id, &descriptors);
@@ -486,6 +577,7 @@ impl Client {
             server.write(descriptors, stream_id);
         });
 
+        self.retain_layouts(&mut layouts);
         layouts
     }
 
@@ -495,7 +587,7 @@ impl Client {
         data: Vec<Bytes>,
     ) -> Vec<MemoryLayout> {
         let stream_id = self.stream_id();
-        let (handle_base, layouts) =
+        let (handle_base, mut layouts) =
             self.utilities
                 .layout_policy
                 .apply(self.service_id(), stream_id, &descriptors);
@@ -523,6 +615,7 @@ impl Client {
             server.write(descriptors, stream_id);
         });
 
+        self.retain_layouts(&mut layouts);
         layouts
     }
 
@@ -609,8 +702,10 @@ impl Client {
     /// Non-blocking: the write is enqueued on this client's current stream.
     pub fn write(&self, handle: &Handle, data: Bytes) {
         let stream_id = self.stream_id();
-        let descriptor =
+        let mut descriptor =
             CopyDescriptor::new(handle.clone().binding(), [data.len()].into(), [1].into(), 1);
+        self.accept_descriptor(&mut descriptor)
+            .unwrap_or_else(|err| panic!("{err}"));
         self.expect_local(&descriptor.handle);
         self.device.submit(move |server| {
             server.write(vec![(descriptor, data)], stream_id);
@@ -727,7 +822,7 @@ impl Client {
 
     fn do_empty(&self, descriptors: Vec<MemoryLayoutDescriptor>) -> Vec<MemoryLayout> {
         let stream_id = self.stream_id();
-        let (handle_base, layouts) =
+        let (handle_base, mut layouts) =
             self.utilities
                 .layout_policy
                 .apply(self.service_id(), stream_id, &descriptors);
@@ -737,6 +832,7 @@ impl Client {
             server.initialize_memory(memory, size, stream_id);
         });
 
+        self.retain_layouts(&mut layouts);
         layouts
     }
 
@@ -901,8 +997,12 @@ impl Client {
         }
 
         let stream_id = self.stream_id();
-        let src = src.binding();
-        let dst = dst.binding();
+        let mut src = src.binding();
+        let mut dst = dst.binding();
+        self.accept_binding(&mut src)
+            .unwrap_or_else(|err| panic!("{err}"));
+        self.accept_binding(&mut dst)
+            .unwrap_or_else(|err| panic!("{err}"));
         self.expect_local(&src);
         self.expect_local(&dst);
 
@@ -929,10 +1029,12 @@ impl Client {
     )]
     pub fn to_client_tensor(
         &mut self,
-        src_descriptor: CopyDescriptor,
+        mut src_descriptor: CopyDescriptor,
         dst_server: &Self,
         dtype: ElemType,
     ) -> Handle {
+        self.accept_descriptor(&mut src_descriptor)
+            .unwrap_or_else(|err| panic!("{err}"));
         self.expect_local(&src_descriptor.handle);
         let stream_id_src = self.stream_id();
         let stream_id_dst = dst_server.stream_id();
@@ -941,12 +1043,13 @@ impl Client {
         let device_id_dst = dst_server.device.device_id();
 
         let mut dst_server = dst_server.clone();
-        let handle = Handle::new(
+        let mut handle = Handle::new(
             dst_server.service_id(),
             stream_id_dst,
             src_descriptor.handle.size_in_used(),
         );
-        let handle_cloned = handle.clone();
+        let mut handle_cloned = handle.clone();
+        handle_cloned.clear_lease();
 
         let device_ids = vec![device_id_src, device_id_dst];
         self.ensure_init_collective(device_ids.clone());
@@ -986,6 +1089,7 @@ impl Client {
         self.device.flush_queue();
         dst_server.device.flush_queue();
 
+        handle.set_lease(dst_server.lease.clone());
         handle
     }
 
@@ -1000,8 +1104,8 @@ impl Client {
     unsafe fn launch_inner(
         &self,
         kernel: Box<dyn CubeKernel>,
-        count: CubeCount,
-        bindings: KernelArguments,
+        mut count: CubeCount,
+        mut bindings: KernelArguments,
         stream_id: StreamId,
     ) {
         // No work, and some drivers reject a zero grid dim.
@@ -1010,9 +1114,13 @@ impl Client {
         {
             return;
         }
-        if let CubeCount::Dynamic(binding) = &count {
+        if let CubeCount::Dynamic(binding) = &mut count {
+            self.accept_binding(binding)
+                .unwrap_or_else(|err| panic!("{err}"));
             self.expect_local(binding);
         }
+        self.accept_arguments(&mut bindings)
+            .unwrap_or_else(|err| panic!("{err}"));
         for resource in &bindings.resources {
             self.expect_local(match resource {
                 KernelResource::Buffer(binding) => binding,
@@ -1142,7 +1250,7 @@ impl Client {
                 // deferred, an observer's cannot be recovered afterwards.
                 let profile = if observed_timing {
                     let method = profile.timing_method();
-                    let ticks = cubecl_environment::future::block_on(profile.resolve());
+                    let ticks = cubecl_environment::future::block_on(profile.into_future());
                     match &ticks {
                         Some(ticks) => crate::logging::notify_timed(name, ticks.duration(), method),
                         // Nothing to tell the observer: the window carried no
@@ -1317,7 +1425,7 @@ impl Client {
 
         self.utilities.logger.profile_summary();
 
-        fut
+        self.retain_future(fut)
     }
 
     /// The bindings `handles` name, which is what crosses to the device
@@ -1330,7 +1438,8 @@ impl Client {
         handles
             .into_iter()
             .map(|handle| {
-                let binding = handle.clone().binding();
+                let mut binding = handle.clone().binding();
+                self.accept_binding(&mut binding)?;
                 self.local(&binding)?;
                 Ok(binding)
             })
@@ -1575,7 +1684,7 @@ impl Client {
                     o,
                     ProfileDuration::new(
                         alloc::boxed::Box::pin(async move {
-                            let ticks = result.resolve().await?;
+                            let ticks = result.into_future().await?;
                             let start_duration =
                                 ticks.start_duration_since(epoch).as_nanos() as i64;
                             let end_duration = ticks.end_duration_since(epoch).as_nanos() as i64;
@@ -1589,7 +1698,7 @@ impl Client {
             });
         }
 
-        result
+        result.map(|(output, profile)| (output, self.retain_profile(profile)))
     }
 
     /// Transfer data from one client to another
@@ -1602,7 +1711,7 @@ impl Client {
     )]
     fn change_client_sync(
         &self,
-        src_descriptor: CopyDescriptor,
+        mut src_descriptor: CopyDescriptor,
         alloc_descriptor: MemoryLayoutDescriptor,
         dst_server: &Self,
     ) -> MemoryLayout {
@@ -1610,6 +1719,8 @@ impl Client {
         let elem_size = src_descriptor.elem_size;
         let stream_id_src = self.stream_id();
         let stream_id_dst = dst_server.stream_id();
+        self.accept_descriptor(&mut src_descriptor)
+            .unwrap_or_else(|err| panic!("{err}"));
 
         let read = self
             .device
@@ -1627,7 +1738,7 @@ impl Client {
             stream_id_dst,
             &[alloc_descriptor],
         );
-        let alloc = layouts.remove(0);
+        let mut alloc = layouts.remove(0);
 
         let desc_descriptor = CopyDescriptor {
             handle: handle_base.clone().binding(),
@@ -1642,6 +1753,7 @@ impl Client {
             server.write(vec![(desc_descriptor, data.remove(0))], stream_id_dst)
         });
 
+        alloc.memory.set_lease(dst_server.lease.clone());
         alloc
     }
 

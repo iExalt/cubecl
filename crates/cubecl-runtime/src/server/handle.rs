@@ -1,4 +1,7 @@
-use cubecl_common::device::ServiceId;
+use cubecl_common::{
+    device::ServiceId,
+    device_handle::{DeviceGenerationId, DeviceLease},
+};
 use cubecl_environment::stream::StreamId;
 use cubecl_zspace::{Shape, Strides};
 
@@ -24,6 +27,7 @@ pub struct Handle {
     pub stream: StreamId,
     /// Length of the underlying buffer ignoring offsets
     pub(crate) size: u64,
+    lease: Option<DeviceLease>,
 }
 
 impl core::fmt::Debug for Handle {
@@ -35,6 +39,7 @@ impl core::fmt::Debug for Handle {
             .field("offset_end", &self.offset_end)
             .field("stream", &self.stream)
             .field("size", &self.size)
+            .field("generation_id", &self.generation_id())
             .finish()
     }
 }
@@ -48,6 +53,7 @@ impl Clone for Handle {
             offset_end: self.offset_end,
             stream: self.stream,
             size: self.size,
+            lease: self.lease.clone(),
         }
     }
 }
@@ -67,6 +73,7 @@ impl Handle {
             offset_end: None,
             stream,
             size,
+            lease: None,
         }
     }
     /// Creates a new handle of the given size.
@@ -78,6 +85,7 @@ impl Handle {
             offset_end: None,
             stream,
             size,
+            lease: None,
         }
     }
     /// Checks whether the handle can be mutated in-place without affecting other computation.
@@ -92,8 +100,10 @@ impl Handle {
 
     /// Returns the [`BufferBinding`] corresponding to the current handle.
     pub fn binding(self) -> BufferBinding {
+        let mut memory = self.memory.binding();
+        memory.set_lease(self.lease);
         BufferBinding {
-            memory: self.memory.binding(),
+            memory,
             service: self.service,
             offset_start: self.offset_start,
             offset_end: self.offset_end,
@@ -144,6 +154,19 @@ impl Handle {
     /// Get the total size of the handle, in bytes.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Returns the device-runner generation retained by this handle, when applicable.
+    pub fn generation_id(&self) -> Option<DeviceGenerationId> {
+        self.lease.as_ref().and_then(DeviceLease::generation_id)
+    }
+
+    pub(crate) fn set_lease(&mut self, lease: DeviceLease) {
+        self.lease = Some(lease);
+    }
+
+    pub(crate) fn clear_lease(&mut self) {
+        self.lease = None;
     }
 }
 
@@ -210,5 +233,14 @@ impl BufferBinding {
     /// Get the total size of the handle, in bytes.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Returns the device-runner generation retained by this binding, when applicable.
+    pub fn generation_id(&self) -> Option<DeviceGenerationId> {
+        self.memory.generation_id()
+    }
+
+    pub(crate) fn clear_lease(&mut self) {
+        self.memory.clear_lease();
     }
 }
