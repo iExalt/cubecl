@@ -12,8 +12,8 @@ use std::{
     boxed::Box,
     cell::RefCell,
     ops::Deref,
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Condvar, LazyLock, Mutex, Weak},
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::{Arc, Condvar, LazyLock, Mutex, Weak, mpsc},
     time::Duration,
     vec::Vec,
 };
@@ -298,10 +298,18 @@ impl ServiceState {
 }
 
 fn shutdown_service_states(states: &mut HashMap<TypeId, ServiceState>) {
+    let mut panic_payload = None;
     for state in states.values_mut() {
-        state.shutdown();
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| state.shutdown())) {
+            if panic_payload.is_none() {
+                panic_payload = Some(payload);
+            }
+        }
     }
     states.clear();
+    if let Some(payload) = panic_payload {
+        resume_unwind(payload);
+    }
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
@@ -423,15 +431,20 @@ struct ShutdownPermit;
 
 impl ShutdownPermit {
     fn acquire() -> Self {
+        let permit = Self::reserve();
+        permit.wait_for_initializers();
+        permit
+    }
+
+    /// Reserves the process-wide shutdown gate without waiting for active initializers. The
+    /// caller can hand this permit to a coordinator thread and apply its own wait bound.
+    fn reserve() -> Self {
         let (mutex, condition) = &*LIFECYCLE;
         let mut lifecycle = mutex.lock().unwrap();
         while lifecycle.shutting_down {
             lifecycle = condition.wait(lifecycle).unwrap();
         }
         lifecycle.shutting_down = true;
-        while lifecycle.active_initializers != 0 {
-            lifecycle = condition.wait(lifecycle).unwrap();
-        }
         Self
     }
 
@@ -556,18 +569,38 @@ pub(crate) fn shutdown_device_bounded_for_test(device_id: DeviceId, timeout: Dur
 }
 
 fn shutdown_device_with_timeout(device_id: DeviceId, timeout: Duration) {
-    // A runner joining itself would deadlock. Cycles through another device are bounded by the
-    // runner join path, but this direct case must be rejected before taking the shutdown permit.
+    // A runner-side synchronous shutdown can deadlock through a same- or cross-device cycle.
+    // Reject it before taking the global shutdown permit; final lease release uses delegation.
     SERVER_THREAD.with_borrow(|current| {
-        if let Some(runner) = current {
-            assert_ne!(
-                runner.device, device_id,
-                "cannot shut down a device from its own runner thread"
-            );
-        }
+        assert!(
+            current.is_none(),
+            "cannot shut down a device from a device runner thread"
+        );
     });
 
-    let permit = ShutdownPermit::acquire();
+    // Reserve the gate immediately so new initializers cannot slip in while the coordinator waits
+    // on an active initializer or a runner. The worker owns the permit and downstream pins until
+    // both stages have drained; the caller only waits up to the requested bound.
+    let permit = ShutdownPermit::reserve();
+    let (done_sender, done_receiver) = mpsc::sync_channel(0);
+    let spawn_result = std::thread::Builder::new()
+        .name(std::format!("cubecl-device-shutdown-{device_id:?}"))
+        .spawn(move || {
+            shutdown_device_staged(device_id, permit);
+            let _ = done_sender.send(());
+        });
+    if spawn_result.is_err() {
+        log::warn!("Failed to spawn device shutdown coordinator for {device_id:?}");
+        return;
+    }
+    if done_receiver.recv_timeout(timeout).is_err() {
+        log::warn!(
+            "Device shutdown for {device_id:?} exceeded {timeout:?}; coordinator continues draining"
+        );
+    }
+}
+
+fn shutdown_device_staged(device_id: DeviceId, permit: ShutdownPermit) {
     // Keep downstream runners alive while upstream shutdown callbacks drain their producer work.
     // Weak registries otherwise allow the downstream generation to disappear between stages.
     let downstream_pins = {
@@ -619,27 +652,20 @@ fn shutdown_device_with_timeout(device_id: DeviceId, timeout: Duration) {
         let mut closed = HashSet::new();
         for closer in closers {
             if closed.insert(closer.generation_id()) {
-                if !closer.shutdown_bounded(timeout) {
-                    log::warn!(
-                        "Device runner {:?} did not stop within {:?}; leaving it Closing",
-                        closer.generation_id(),
-                        timeout
-                    );
-                } else {
-                    // Remove only after the generation reached Closed. Keeping a timed-out
-                    // entry in RUNNERS makes new initializers wait instead of racing a live old
-                    // runner with a replacement.
-                    let mut guard = RUNNERS.lock();
-                    if let Some(runners) = guard.as_mut() {
-                        runners.retain(|runner_id, entry| {
-                            if runner_id.device != device_id || runner_id.stage != stage {
-                                return true;
-                            }
-                            entry.closer().is_some_and(|candidate| {
-                                candidate.generation_id() != closer.generation_id()
-                            })
-                        });
-                    }
+                let _ = closer.shutdown();
+                // Remove only after the generation reached Closed. Keeping a timed-out
+                // coordinator's entries in RUNNERS makes new initializers wait instead of racing
+                // a live old runner with a replacement.
+                let mut guard = RUNNERS.lock();
+                if let Some(runners) = guard.as_mut() {
+                    runners.retain(|runner_id, entry| {
+                        if runner_id.device != device_id || runner_id.stage != stage {
+                            return true;
+                        }
+                        entry.closer().is_some_and(|candidate| {
+                            candidate.generation_id() != closer.generation_id()
+                        })
+                    });
                 }
             }
         }
@@ -1140,20 +1166,6 @@ mod custom_channel {
         pub(super) fn shutdown(&self) -> Result<(), ()> {
             RuntimeGeneration::close_forced(&self.generation).map(|_| ())
         }
-
-        pub(super) fn shutdown_bounded(&self, timeout: Duration) -> bool {
-            match RuntimeGeneration::close_forced_bounded(&self.generation, timeout) {
-                Ok(()) => true,
-                Err(JoinError::Timeout) => false,
-                Err(JoinError::Panicked) => {
-                    log::warn!(
-                        "Device runner {:?} panicked during bounded shutdown",
-                        self.generation.runner_id
-                    );
-                    true
-                }
-            }
-        }
     }
 
     #[derive(Clone)]
@@ -1179,11 +1191,6 @@ mod custom_channel {
     struct GenerationLifecycle {
         status: GenerationStatus,
         runner_panicked: bool,
-    }
-
-    enum JoinError {
-        Timeout,
-        Panicked,
     }
 
     struct RuntimeGeneration {
@@ -1312,18 +1319,6 @@ mod custom_channel {
                 .map(|()| DeviceLeaseRelease::Closed)
         }
 
-        fn finish_close_bounded(
-            generation: &Arc<Self>,
-            timeout: Duration,
-        ) -> Result<(), JoinError> {
-            if is_device_runner_thread(&generation.runner_id) {
-                Self::delegate_join(generation);
-                return Ok(());
-            }
-
-            generation.join_runner_with_timeout(Some(timeout))
-        }
-
         fn close_if_unowned(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
             match generation.begin_close(true) {
                 BeginClose::Shared => Ok(DeviceLeaseRelease::Shared),
@@ -1334,18 +1329,6 @@ mod custom_channel {
         fn close_forced(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
             match generation.begin_close(false) {
                 BeginClose::Started | BeginClose::AlreadyClosing => Self::finish_close(generation),
-                BeginClose::Shared => unreachable!("forced close ignores external owners"),
-            }
-        }
-
-        fn close_forced_bounded(
-            generation: &Arc<Self>,
-            timeout: Duration,
-        ) -> Result<(), JoinError> {
-            match generation.begin_close(false) {
-                BeginClose::Started | BeginClose::AlreadyClosing => {
-                    Self::finish_close_bounded(generation, timeout)
-                }
                 BeginClose::Shared => unreachable!("forced close ignores external owners"),
             }
         }
@@ -1412,26 +1395,6 @@ mod custom_channel {
         }
 
         fn join_runner(&self) -> Result<(), ()> {
-            self.join_runner_with_timeout(None).map_err(|_| ())
-        }
-
-        fn join_runner_with_timeout(&self, timeout: Option<Duration>) -> Result<(), JoinError> {
-            if let Some(timeout) = timeout {
-                let deadline = std::time::Instant::now() + timeout;
-                let mut lifecycle = self.lifecycle.lock().unwrap();
-                while lifecycle.status != GenerationStatus::Closed {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Err(JoinError::Timeout);
-                    }
-                    let (next, wait) = self.closed.wait_timeout(lifecycle, remaining).unwrap();
-                    lifecycle = next;
-                    if wait.timed_out() && lifecycle.status != GenerationStatus::Closed {
-                        return Err(JoinError::Timeout);
-                    }
-                }
-            }
-
             let join_handle = self.join_handle.lock().unwrap().take();
             if let Some(join_handle) = join_handle {
                 self.runner_close_fallback.store(false, Ordering::Release);
@@ -1446,7 +1409,7 @@ mod custom_channel {
 
             let lifecycle = self.lifecycle.lock().unwrap();
             if lifecycle.runner_panicked {
-                Err(JoinError::Panicked)
+                Err(())
             } else {
                 Ok(())
             }
@@ -1648,9 +1611,12 @@ mod custom_channel {
                         server.start();
                         shutdown();
                     }));
+                    // Drop task buffers and service state before publishing Closed. The shutdown
+                    // callback catches each service-hook panic and clears TLS state before
+                    // rethrowing, so a replacement cannot overlap teardown.
+                    drop(server);
                     core::mem::drop(runner_reference);
 
-                    // Service shutdown and task capture drops have completed before this point.
                     // Marking closed wakes replacement waiters; the JoinHandle remains owned by
                     // an off-runner closer, which still joins it before reporting completion.
                     runner_generation.mark_closed(result.is_err());
@@ -2005,7 +1971,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.message().is_some_and(|message| {
-            message.contains("cannot shut down a device from its own runner thread")
+            message.contains("cannot shut down a device from a device runner thread")
         }));
         assert_eq!(handle.submit_blocking(|state| state.counter).unwrap(), 0);
     }
