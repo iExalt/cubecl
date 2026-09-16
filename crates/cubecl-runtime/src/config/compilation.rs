@@ -1,4 +1,6 @@
 use super::logger::{LogLevel, LoggerConfig};
+#[cfg(std_io)]
+use alloc::string::String;
 
 /// Configuration for compilation settings in `CubeCL`.
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -10,6 +12,10 @@ pub struct CompilationConfig {
     #[serde(default)]
     #[cfg(std_io)]
     pub cache: bool,
+    /// Caller-provided namespace for invalidating compiled kernels after backend or codegen changes.
+    #[serde(default)]
+    #[cfg(std_io)]
+    pub cache_namespace: Option<String>,
     /// Controls whether kernel launches enforce bounds checks.
     #[serde(default)]
     pub check_mode: BoundsCheckMode,
@@ -93,3 +99,20 @@ pub enum CompilationLogLevel {
 }
 
 impl LogLevel for CompilationLogLevel {}
+
+#[cfg(all(test, std_io))]
+mod tests {
+    use super::CompilationConfig;
+
+    #[test]
+    fn cache_namespace_is_optional_and_round_trips() {
+        let config: CompilationConfig =
+            toml::from_str("cache = true\ncache_namespace = \"cuda-strict-ptx\"\n").unwrap();
+
+        assert!(config.cache);
+        assert_eq!(config.cache_namespace.as_deref(), Some("cuda-strict-ptx"));
+
+        let default: CompilationConfig = toml::from_str("cache = true\n").unwrap();
+        assert_eq!(default.cache_namespace, None);
+    }
+}

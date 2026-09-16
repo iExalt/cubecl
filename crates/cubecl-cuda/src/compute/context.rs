@@ -77,16 +77,37 @@ pub struct PtxCacheEntry {
     io: Option<Vec<BufferIOAttr>>,
 }
 
+/// Owns the NVRTC program handle until compilation and PTX extraction finish.
+///
+/// NVRTC allocates this opaque handle outside Rust's ownership system. Keeping
+/// destruction in a guard also covers compiler errors and cache misses, where
+/// an early return would otherwise leak the program.
+struct NvrtcProgram(cudarc::nvrtc::sys::nvrtcProgram);
+
+impl Drop for NvrtcProgram {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a live NVRTC program created by `create_program`,
+        // and this guard owns its only destruction call.
+        if let Err(err) = unsafe { cudarc::nvrtc::result::destroy_program(self.0) } {
+            log::warn!("Unable to destroy NVRTC program: {err}");
+        }
+    }
+}
+
 impl CudaContext {
     pub fn new(
         compilation_options: CompilationOptions,
         properties: DeviceProperties,
         context: *mut CUctx_st,
         arch: CudaArchitecture,
+        device: cudarc::driver::sys::CUdevice,
     ) -> Self {
-        let ptx_cache = compilation_store("cuda", format!("ptx_sm{}", arch.version));
-        let second_line_ptx_cache =
-            compilation_store("cuda-second-line", format!("ptx_sm{}", arch.version));
+        let fingerprint = ptx_cache_fingerprint(&compilation_options, &arch, device);
+        // Store namespaces become database path components in some environment
+        // backends. Hash the detailed identity to keep the component portable.
+        let fingerprint = format!("{:x}", StableHasher::hash_one(&fingerprint));
+        let ptx_cache = compilation_store("cuda", &fingerprint);
+        let second_line_ptx_cache = compilation_store("cuda-second-line", &fingerprint);
 
         Self {
             context,
@@ -232,15 +253,16 @@ impl CudaContext {
             // I'd like to set the name to the kernel name, but keep getting UTF-8 errors so let's
             // leave it `None` for now
             let source = CString::from_str(&kernel_compiled.source).unwrap();
-            let program =
+            let program = NvrtcProgram(
                 cudarc::nvrtc::result::create_program(source.as_c_str(), None).map_err(|err| {
                     CompilationError::Generic {
                         reason: format!("{err}"),
                         backtrace: BackTrace::capture(),
                     }
-                })?;
-            if cudarc::nvrtc::result::compile_program(program, &options).is_err() {
-                let log_raw = cudarc::nvrtc::result::get_program_log(program).map_err(|err| {
+                })?,
+            );
+            if cudarc::nvrtc::result::compile_program(program.0, &options).is_err() {
+                let log_raw = cudarc::nvrtc::result::get_program_log(program.0).map_err(|err| {
                     CompilationError::Generic {
                         reason: format!("{err}"),
                         backtrace: BackTrace::capture(),
@@ -260,7 +282,7 @@ impl CudaContext {
                     backtrace: BackTrace::capture(),
                 })?;
             };
-            cudarc::nvrtc::result::get_ptx(program).map_err(|err| CompilationError::Generic {
+            cudarc::nvrtc::result::get_ptx(program.0).map_err(|err| CompilationError::Generic {
                 reason: format!("{err}"),
                 backtrace: BackTrace::capture(),
             })?
@@ -413,5 +435,69 @@ impl CudaContext {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Build an identity for PTX that includes every input that can change the
+/// generated or executable artifact. The caller hashes this string before
+/// passing it to the persistent store, so device names and configured
+/// namespaces cannot become path components.
+fn ptx_cache_fingerprint(
+    compilation_options: &CompilationOptions,
+    arch: &CudaArchitecture,
+    device: cudarc::driver::sys::CUdevice,
+) -> String {
+    use cubecl_runtime::config::RuntimeConfig;
+
+    let config = cubecl_runtime::config::CubeClRuntimeConfig::get();
+    let namespace = config
+        .compilation
+        .cache_namespace
+        .as_deref()
+        .unwrap_or(concat!("cubecl-cuda-", env!("CARGO_PKG_VERSION")));
+    let device_name =
+        cudarc::driver::result::device::get_name(device).unwrap_or_else(|_| "unknown".to_string());
+    let device_uuid = cudarc::driver::result::device::get_uuid(device)
+        .map(|uuid| {
+            uuid.bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    format!(
+        "schema=1;namespace={namespace};cuda_header={};driver={};nvrtc={};arch={arch:?};device_name={device_name};device_uuid={device_uuid};options={compilation_options:?};check_mode={:?}",
+        cudarc::driver::sys::CUDA_VERSION,
+        cuda_driver_version(),
+        nvrtc_version(),
+        config.compilation.check_mode,
+    )
+}
+
+fn cuda_driver_version() -> i32 {
+    let mut version = 0;
+    // SAFETY: `cuDriverGetVersion` writes one integer to the provided pointer.
+    if unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut version) }
+        .result()
+        .is_ok()
+    {
+        version
+    } else {
+        0
+    }
+}
+
+fn nvrtc_version() -> String {
+    let mut major = 0;
+    let mut minor = 0;
+    // SAFETY: `nvrtcVersion` writes two integers to the provided pointers.
+    if unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) }
+        .result()
+        .is_ok()
+    {
+        format!("{major}.{minor}")
+    } else {
+        "unknown".to_string()
     }
 }

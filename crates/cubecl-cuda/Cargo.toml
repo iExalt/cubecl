@@ -18,6 +18,7 @@ workspace = true
 [features]
 default = [
     "std",
+    "cubecl-runtime/default",
     "cubecl-server/default",
     "cubecl-common/default",
     "cubecl-core/default",
@@ -25,6 +26,7 @@ default = [
 pliron-dump = ["cubecl-cpp/pliron-dump"]
 ptx-wmma = []
 std = [
+    "cubecl-runtime/std",
     "cubecl-server/std",
     "cubecl-common/std",
     "cubecl-core/std",
@@ -33,6 +35,7 @@ std = [
 
 tracing = [
     "dep:tracing",
+    "cubecl-runtime/tracing",
     "cubecl-server/tracing",
     "cubecl-common/tracing",
     "cubecl-core/tracing",
@@ -50,6 +53,10 @@ cubecl-common = { path = "../cubecl-common", version = "=0.11.0-pre.5", default-
 ] }
 cubecl-environment = { path = "../cubecl-environment", version = "=0.11.0-pre.5", default-features = false }
 cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.5", default-features = false }
+cubecl-runtime = { path = "../cubecl-runtime", version = "=0.11.0-pre.5", default-features = false, features = [
+    "channel-mutex",
+    "std",
+] }
 cubecl-cpp = { path = "../cubecl-cpp", version = "=0.11.0-pre.5", default-features = false, features = [
 ] }
 cubecl-server = { path = "../cubecl-server", version = "=0.11.0-pre.5", default-features = false, features = [

@@ -375,7 +375,7 @@ impl DeviceService for CudaServer {
     }
 
     fn shutdown(&mut self) {
-        if let Err(err) = self.shutdown() {
+        if let Err(err) = CudaServer::shutdown(self) {
             log::warn!("Unable to synchronize CUDA during shutdown: {err}");
         }
     }
