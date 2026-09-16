@@ -6,7 +6,7 @@ use cubecl_common::bytes::Bytes;
 use cubecl_common::device::{Device, DeviceId, ServiceId};
 use cubecl_environment::stream::StreamId;
 use cubecl_ir::{ElemType, UIntKind};
-use cubecl_runtime::lifecycle::{RuntimeGuard, RuntimeSession};
+use cubecl_runtime::lifecycle::RuntimeSession;
 use cubecl_server::client::Client;
 use cubecl_server::server::{CubeCount, Handle, KernelArguments, ServerError};
 use cubecl_server::{local_tuner, tune::LocalTuner};
@@ -177,14 +177,14 @@ fn graph_final_owner_submits_destroy_before_generation_closes() {
 #[test_log::test]
 #[serial_test::serial]
 fn graph_drop_after_forced_shutdown_does_not_panic() {
-    let guard = RuntimeGuard::acquire().unwrap();
-    let client = Client::load::<DummyServer>(DeviceId::new(0, 107));
+    let device_id = DeviceId::new(0, 107);
+    let client = Client::load::<DummyServer>(device_id);
     client.graph_prepare().unwrap();
     client.start_capture().unwrap();
     let graph = client.stop_capture().unwrap();
     drop(client);
 
-    guard.shutdown().unwrap();
+    cubecl_common::device_handle::DeviceHandle::<DummyServer>::shutdown(device_id);
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(graph))).is_ok());
 }
 
