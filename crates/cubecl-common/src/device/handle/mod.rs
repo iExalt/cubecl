@@ -281,6 +281,12 @@ impl<S: ?Sized + 'static, I: DeviceHandleSpec> DeviceHandle<S, I> {
         self.handle.submit(move |state| task(cast(state)))
     }
 
+    /// Tries to enqueue a task without panicking when the runner is closed.
+    pub fn try_submit<T: FnOnce(&mut S) + Send + 'static>(&self, task: T) -> Result<(), CallError> {
+        let cast = self.cast;
+        self.handle.try_submit(move |state| task(cast(state)))
+    }
+
     pub fn flush_queue(&self) {
         self.handle.flush_queue();
     }

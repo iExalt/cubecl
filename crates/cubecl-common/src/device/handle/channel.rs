@@ -14,6 +14,7 @@ use std::{
     ops::Deref,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Condvar, LazyLock, Mutex, Weak},
+    time::Duration,
     vec::Vec,
 };
 
@@ -24,6 +25,8 @@ use custom_channel::{DeviceClient, GenerationCloser, GenerationUpgrade, WeakDevi
 
 static CREATED_GENERATIONS: AtomicU64 = AtomicU64::new(0);
 static CLOSED_GENERATIONS: AtomicU64 = AtomicU64::new(0);
+/// Upper bound for synchronous device-wide shutdown calls.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) fn generation_metrics() -> (u64, u64) {
     (
@@ -85,7 +88,7 @@ impl DeviceHandleSpec for ChannelDeviceHandle {
     }
 
     fn shutdown(device_id: DeviceId) {
-        let _ = shutdown_device(device_id);
+        shutdown_device(device_id);
     }
 
     /// Runs `task` on the device thread, blocking until it returns.
@@ -102,6 +105,13 @@ impl DeviceHandleSpec for ChannelDeviceHandle {
     fn submit<T: FnOnce(&mut dyn Any) + Send + 'static>(&self, task: T) {
         self.submit_inner::<_, SEND_NO_FLUSH>(task)
             .expect("Can't have an error when submitting a task");
+    }
+
+    fn try_submit<T: FnOnce(&mut dyn Any) + Send + 'static>(
+        &self,
+        task: T,
+    ) -> Result<(), CallError> {
+        self.submit_inner::<_, SEND_NO_FLUSH>(task)
     }
 
     fn flush_queue(&self) {
@@ -537,6 +547,15 @@ pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
 
 /// Force-closes every service runner for one device, preserving upstream-first ordering.
 pub(crate) fn shutdown_device(device_id: DeviceId) {
+    shutdown_device_with_timeout(device_id, SHUTDOWN_JOIN_TIMEOUT);
+}
+
+#[cfg(test)]
+pub(crate) fn shutdown_device_bounded_for_test(device_id: DeviceId, timeout: Duration) {
+    shutdown_device_with_timeout(device_id, timeout);
+}
+
+fn shutdown_device_with_timeout(device_id: DeviceId, timeout: Duration) {
     // A runner joining itself would deadlock. Cycles through another device are bounded by the
     // runner join path, but this direct case must be rejected before taking the shutdown permit.
     SERVER_THREAD.with_borrow(|current| {
@@ -549,6 +568,28 @@ pub(crate) fn shutdown_device(device_id: DeviceId) {
     });
 
     let permit = ShutdownPermit::acquire();
+    // Keep downstream runners alive while upstream shutdown callbacks drain their producer work.
+    // Weak registries otherwise allow the downstream generation to disappear between stages.
+    let downstream_pins = {
+        let guard = RUNNERS.lock();
+        guard
+            .as_ref()
+            .into_iter()
+            .flat_map(HashMap::iter)
+            .filter_map(|(runner_id, entry)| {
+                if runner_id.device != device_id
+                    || runner_id.stage != DeviceServiceStage::Downstream
+                {
+                    return None;
+                }
+                match entry.upgrade() {
+                    GenerationUpgrade::Ready(client) => Some(client),
+                    GenerationUpgrade::Closing(_) | GenerationUpgrade::Gone => None,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
     for stage in [DeviceServiceStage::Upstream, DeviceServiceStage::Downstream] {
         permit.wait_for_initializers();
         {
@@ -560,21 +601,17 @@ pub(crate) fn shutdown_device(device_id: DeviceId) {
             }
         }
         let closers = {
-            let mut guard = RUNNERS.lock();
+            let guard = RUNNERS.lock();
             guard
-                .as_mut()
+                .as_ref()
                 .into_iter()
                 .flat_map(|runners| {
-                    let keys = runners
-                        .keys()
-                        .filter(|runner_id| {
+                    runners
+                        .iter()
+                        .filter(|(runner_id, _)| {
                             runner_id.device == device_id && runner_id.stage == stage
                         })
-                        .copied()
-                        .collect::<Vec<_>>();
-                    keys.into_iter()
-                        .filter_map(|key| runners.remove(&key))
-                        .filter_map(|entry| entry.closer())
+                        .filter_map(|(_, entry)| entry.closer())
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
@@ -582,10 +619,32 @@ pub(crate) fn shutdown_device(device_id: DeviceId) {
         let mut closed = HashSet::new();
         for closer in closers {
             if closed.insert(closer.generation_id()) {
-                let _ = closer.shutdown();
+                if !closer.shutdown_bounded(timeout) {
+                    log::warn!(
+                        "Device runner {:?} did not stop within {:?}; leaving it Closing",
+                        closer.generation_id(),
+                        timeout
+                    );
+                } else {
+                    // Remove only after the generation reached Closed. Keeping a timed-out
+                    // entry in RUNNERS makes new initializers wait instead of racing a live old
+                    // runner with a replacement.
+                    let mut guard = RUNNERS.lock();
+                    if let Some(runners) = guard.as_mut() {
+                        runners.retain(|runner_id, entry| {
+                            if runner_id.device != device_id || runner_id.stage != stage {
+                                return true;
+                            }
+                            entry.closer().is_some_and(|candidate| {
+                                candidate.generation_id() != closer.generation_id()
+                            })
+                        });
+                    }
+                }
             }
         }
     }
+    core::mem::drop(downstream_pins);
 }
 
 impl ChannelDeviceState {
@@ -1081,6 +1140,20 @@ mod custom_channel {
         pub(super) fn shutdown(&self) -> Result<(), ()> {
             RuntimeGeneration::close_forced(&self.generation).map(|_| ())
         }
+
+        pub(super) fn shutdown_bounded(&self, timeout: Duration) -> bool {
+            match RuntimeGeneration::close_forced_bounded(&self.generation, timeout) {
+                Ok(()) => true,
+                Err(JoinError::Timeout) => false,
+                Err(JoinError::Panicked) => {
+                    log::warn!(
+                        "Device runner {:?} panicked during bounded shutdown",
+                        self.generation.runner_id
+                    );
+                    true
+                }
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -1106,6 +1179,11 @@ mod custom_channel {
     struct GenerationLifecycle {
         status: GenerationStatus,
         runner_panicked: bool,
+    }
+
+    enum JoinError {
+        Timeout,
+        Panicked,
     }
 
     struct RuntimeGeneration {
@@ -1234,6 +1312,18 @@ mod custom_channel {
                 .map(|()| DeviceLeaseRelease::Closed)
         }
 
+        fn finish_close_bounded(
+            generation: &Arc<Self>,
+            timeout: Duration,
+        ) -> Result<(), JoinError> {
+            if is_device_runner_thread(&generation.runner_id) {
+                Self::delegate_join(generation);
+                return Ok(());
+            }
+
+            generation.join_runner_with_timeout(Some(timeout))
+        }
+
         fn close_if_unowned(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
             match generation.begin_close(true) {
                 BeginClose::Shared => Ok(DeviceLeaseRelease::Shared),
@@ -1244,6 +1334,18 @@ mod custom_channel {
         fn close_forced(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
             match generation.begin_close(false) {
                 BeginClose::Started | BeginClose::AlreadyClosing => Self::finish_close(generation),
+                BeginClose::Shared => unreachable!("forced close ignores external owners"),
+            }
+        }
+
+        fn close_forced_bounded(
+            generation: &Arc<Self>,
+            timeout: Duration,
+        ) -> Result<(), JoinError> {
+            match generation.begin_close(false) {
+                BeginClose::Started | BeginClose::AlreadyClosing => {
+                    Self::finish_close_bounded(generation, timeout)
+                }
                 BeginClose::Shared => unreachable!("forced close ignores external owners"),
             }
         }
@@ -1310,6 +1412,26 @@ mod custom_channel {
         }
 
         fn join_runner(&self) -> Result<(), ()> {
+            self.join_runner_with_timeout(None).map_err(|_| ())
+        }
+
+        fn join_runner_with_timeout(&self, timeout: Option<Duration>) -> Result<(), JoinError> {
+            if let Some(timeout) = timeout {
+                let deadline = std::time::Instant::now() + timeout;
+                let mut lifecycle = self.lifecycle.lock().unwrap();
+                while lifecycle.status != GenerationStatus::Closed {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(JoinError::Timeout);
+                    }
+                    let (next, wait) = self.closed.wait_timeout(lifecycle, remaining).unwrap();
+                    lifecycle = next;
+                    if wait.timed_out() && lifecycle.status != GenerationStatus::Closed {
+                        return Err(JoinError::Timeout);
+                    }
+                }
+            }
+
             let join_handle = self.join_handle.lock().unwrap().take();
             if let Some(join_handle) = join_handle {
                 self.runner_close_fallback.store(false, Ordering::Release);
@@ -1324,7 +1446,7 @@ mod custom_channel {
 
             let lifecycle = self.lifecycle.lock().unwrap();
             if lifecycle.runner_panicked {
-                Err(())
+                Err(JoinError::Panicked)
             } else {
                 Ok(())
             }
@@ -1528,12 +1650,10 @@ mod custom_channel {
                     }));
                     core::mem::drop(runner_reference);
 
-                    if runner_generation
-                        .runner_close_fallback
-                        .load(Ordering::Acquire)
-                    {
-                        runner_generation.mark_closed(result.is_err());
-                    }
+                    // Service shutdown and task capture drops have completed before this point.
+                    // Marking closed wakes replacement waiters; the JoinHandle remains owned by
+                    // an off-runner closer, which still joins it before reporting completion.
+                    runner_generation.mark_closed(result.is_err());
 
                     if let Err(err) = result {
                         resume_unwind(err);
@@ -1792,6 +1912,7 @@ mod custom_channel {
 #[cfg(test)]
 mod tests {
     use crate::device::handle::channel::custom_channel::CHANNEL_MAX_TASK;
+    use crate::device::handle::channel::custom_channel::GenerationStatus;
     use crate::device::handle::{CallResultExt, DeviceLeaseRelease};
     use crate::device_handle::DeviceHandle;
 
@@ -1904,6 +2025,95 @@ mod tests {
             message.contains("cannot shut down device services from a device runner thread")
         }));
         assert_eq!(handle.submit_blocking(|state| state.counter).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_bounded_device_shutdown_leaves_closing_generation_until_drain() {
+        struct BlockingService {
+            gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        }
+
+        impl DeviceService for BlockingService {
+            fn init(_id: DeviceId) -> Self {
+                Self { gate: None }
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                let Some(gate) = self.gate.take() else {
+                    return;
+                };
+                let (lock, condition) = &*gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 1002,
+        };
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let handle = DeviceHandle::<BlockingService, ChannelDeviceHandle>::insert(
+            device_id,
+            BlockingService {
+                gate: Some(Arc::clone(&gate)),
+            },
+        )
+        .unwrap();
+        let old_generation = handle.handle.state.client.generation_id();
+        let old_client = handle.handle.state.client.clone();
+
+        shutdown_device_bounded_for_test(device_id, Duration::from_millis(10));
+        assert_eq!(old_client.generation_status(), GenerationStatus::Closing);
+
+        let replacement = std::thread::spawn(move || {
+            DeviceHandle::<BlockingService, ChannelDeviceHandle>::new(device_id)
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        let (lock, condition) = &*gate;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+
+        let replacement = replacement.join().unwrap();
+        assert_ne!(
+            old_generation,
+            replacement.handle.state.client.generation_id(),
+            "a timed-out closing generation must not be reused"
+        );
+        assert_eq!(
+            replacement.submit_blocking(|_| 7).unwrap(),
+            7,
+            "replacement must be usable after the old runner drains"
+        );
+        drop((old_client, handle, replacement));
+    }
+
+    #[test]
+    fn test_try_submit_rejects_closed_generation_without_running_task() {
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 1003,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
+        DeviceHandle::<MockService, ChannelDeviceHandle>::shutdown(device_id);
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_task = Arc::clone(&ran);
+        let error = handle
+            .try_submit(move |_| {
+                ran_task.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap_err();
+
+        assert!(error.message().is_none());
+        assert!(error.into_panic().is_none());
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
     #[test]

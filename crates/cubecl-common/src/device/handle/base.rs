@@ -192,6 +192,15 @@ pub trait DeviceHandleSpec: Sized + Clone {
 
     fn submit<T: FnOnce(&mut dyn Any) + Send + 'static>(&self, task: T);
 
+    /// Tries to enqueue a task without panicking when the runner is closed.
+    fn try_submit<T: FnOnce(&mut dyn Any) + Send + 'static>(
+        &self,
+        task: T,
+    ) -> Result<(), CallError> {
+        self.submit(task);
+        Ok(())
+    }
+
     fn exclusive<R: Send, T: FnOnce() -> R + Send>(&self, task: T) -> Result<R, CallError>;
 
     fn shutdown(device_id: DeviceId) {
