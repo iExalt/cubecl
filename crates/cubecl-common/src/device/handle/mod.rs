@@ -410,6 +410,37 @@ pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
 }
 
 #[cfg(test)]
+mod lease_tests {
+    use super::{DeviceGenerationMetrics, DeviceLease, DeviceLeaseRelease};
+
+    #[test]
+    fn test_device_generation_metrics_delta_saturates() {
+        let earlier = DeviceGenerationMetrics {
+            created_generations: 5,
+            closed_generations: 4,
+        };
+        let current = DeviceGenerationMetrics {
+            created_generations: 3,
+            closed_generations: 6,
+        };
+
+        let delta = current.delta(earlier);
+
+        assert_eq!(0, delta.created_generations());
+        assert_eq!(2, delta.closed_generations());
+        assert_eq!(0, delta.active_generations());
+    }
+
+    #[test]
+    fn test_stateless_lease_release() {
+        assert_eq!(
+            DeviceLease::stateless().release().unwrap(),
+            DeviceLeaseRelease::Stateless
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests_channel {
     type DeviceHandle<S> = super::DeviceHandle<S, channel::ChannelDeviceHandle>;
 

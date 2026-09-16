@@ -30,6 +30,19 @@ fn test_concurrent_increment() {
     let count = context.submit_blocking(move |state| state.counter).unwrap();
     assert_eq!(count, thread_count);
 }
+
+#[test]
+fn test_device_lease_clone_preserves_generation() {
+    let context = DeviceFixture::new(
+        DeviceHandle::<TestDeviceState<9>>::new,
+        DeviceHandle::<TestDeviceState<9>>::shutdown,
+    );
+    let lease = context.lease();
+    let cloned = lease.clone();
+
+    assert_eq!(lease.generation_id(), cloned.generation_id());
+}
+
 #[test]
 fn test_recursive_execution_different_state() {
     let context = DeviceFixture::new(

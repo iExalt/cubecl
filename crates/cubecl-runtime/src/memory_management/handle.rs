@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_alias_identity() {
+    fn test_is_alias_of() {
         let handle = ManagedMemoryHandle::new();
         let alias = handle.clone();
         let independent = ManagedMemoryHandle::new();
