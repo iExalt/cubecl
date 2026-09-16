@@ -695,20 +695,22 @@ pub(crate) fn check_autotune_outputs<K: AutotuneKey, O: AutotuneOutput>(
         .position(|(index, _, _)| *index == reference_index)
         .expect("Autotune reference index should identify a candidate output");
     let reference = checks_outputs.remove(reference_idx);
-    let reference_result = reference.2;
-    #[cfg(std_io)]
-    let reference_name = reference.1;
+    let (reference_index, reference_name, reference_result) = reference;
 
     let is_recording = is_recording_enabled();
 
     #[cfg(std_io)]
     {
         let reference_passed = reference_result.is_ok();
-        let checks_outputs = checks_outputs
-            .into_iter()
-            .map(|(_, name, result)| (name, result))
-            .collect();
-        let mut check_results = execute_checks(checks_outputs, reference_result, is_recording);
+        let mut check_results = execute_checks(
+            checks_outputs,
+            (reference_index, &reference_name),
+            reference_result,
+            tuner_name,
+            device_id,
+            key,
+            is_recording,
+        );
         check_results.push(crate::tune::log::CheckResult {
             name: reference_name,
             passed: reference_passed,
@@ -719,11 +721,15 @@ pub(crate) fn check_autotune_outputs<K: AutotuneKey, O: AutotuneOutput>(
 
     #[cfg(not(std_io))]
     {
-        let checks_outputs = checks_outputs
-            .into_iter()
-            .map(|(_, name, result)| (name, result))
-            .collect();
-        execute_checks(checks_outputs, reference_result, is_recording)
+        execute_checks(
+            checks_outputs,
+            (reference_index, "reference"),
+            reference_result,
+            tuner_name,
+            device_id,
+            key,
+            is_recording,
+        )
     }
 }
 
@@ -739,14 +745,18 @@ fn is_recording_enabled() -> bool {
 
 #[cfg(feature = "autotune-checks")]
 fn execute_checks<O: AutotuneOutput>(
-    checks_outputs: Vec<(String, Result<O, AutotuneError>)>,
+    checks_outputs: Vec<(usize, String, Result<O, AutotuneError>)>,
+    reference: (usize, &str),
     reference_result: Result<O, AutotuneError>,
+    tuner_name: &str,
+    device_id: &impl core::fmt::Display,
+    key: &impl core::fmt::Display,
     is_recording: bool,
 ) -> Vec<crate::tune::log::CheckResult> {
     let mut check_results = Vec::new();
 
-    let Ok(reference) = reference_result else {
-        for (name, _) in checks_outputs.into_iter() {
+    let Ok(reference_output) = reference_result else {
+        for (_, name, _) in checks_outputs.into_iter() {
             check_results.push(crate::tune::log::CheckResult {
                 name,
                 passed: false,
@@ -755,9 +765,18 @@ fn execute_checks<O: AutotuneOutput>(
         return check_results;
     };
 
-    for (name, other_result) in checks_outputs.into_iter() {
+    for (candidate_index, name, other_result) in checks_outputs.into_iter() {
         if let Ok(other) = other_result {
-            let passed = check_equivalence(&reference, other, is_recording);
+            let passed = check_equivalence(
+                &reference_output,
+                other,
+                (candidate_index, &name),
+                reference,
+                tuner_name,
+                device_id,
+                key,
+                is_recording,
+            );
             check_results.push(crate::tune::log::CheckResult { name, passed });
         } else {
             check_results.push(crate::tune::log::CheckResult {
@@ -771,24 +790,79 @@ fn execute_checks<O: AutotuneOutput>(
 }
 
 #[cfg(feature = "autotune-checks")]
-fn check_equivalence<O: AutotuneOutput>(reference: &O, other: O, is_recording: bool) -> bool {
+fn check_equivalence<O: AutotuneOutput>(
+    reference_output: &O,
+    other: O,
+    candidate: (usize, &str),
+    reference: (usize, &str),
+    tuner_name: &str,
+    device_id: &impl core::fmt::Display,
+    key: &impl core::fmt::Display,
+    is_recording: bool,
+) -> bool {
     // When the results are being recorded, we catch the panic so we can collect and report every
     // check failure. With nothing recording, we let it panic immediately rather than pass silently.
     if is_recording {
         #[cfg(std_io)]
         {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                reference.check_equivalence(other);
+                reference_output.check_equivalence(other);
             }))
+            .map_err(|payload| {
+                log::warn!(
+                    "Autotune candidate {} '{}' failed correctness check against reference {} '{}' for tuner '{}', device '{}', and key '{}': {}",
+                    candidate.0,
+                    candidate.1,
+                    reference.0,
+                    reference.1,
+                    tuner_name,
+                    device_id,
+                    key,
+                    panic_payload_message(payload),
+                );
+            })
             .is_ok()
         }
         #[cfg(not(std_io))]
         {
-            reference.check_equivalence(other);
+            reference_output.check_equivalence(other);
             true
         }
     } else {
-        reference.check_equivalence(other);
-        true
+        #[cfg(std_io)]
+        {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reference_output.check_equivalence(other);
+            })) {
+                Ok(()) => true,
+                Err(payload) => panic!(
+                    "Autotune candidate {} '{}' failed correctness check against reference {} '{}' for tuner '{}', device '{}', and key '{}': {}",
+                    candidate.0,
+                    candidate.1,
+                    reference.0,
+                    reference.1,
+                    tuner_name,
+                    device_id,
+                    key,
+                    panic_payload_message(payload),
+                ),
+            }
+        }
+        #[cfg(not(std_io))]
+        {
+            reference_output.check_equivalence(other);
+            true
+        }
+    }
+}
+
+#[cfg(all(feature = "autotune-checks", std_io))]
+fn panic_payload_message(payload: Box<dyn core::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
