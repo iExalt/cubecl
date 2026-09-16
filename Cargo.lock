@@ -823,6 +823,7 @@ dependencies = [
  "cubecl-core",
  "cubecl-cpp",
  "cubecl-environment",
+ "cubecl-runtime",
  "cubecl-server",
  "cubecl-std",
  "cudarc",
