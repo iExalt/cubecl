@@ -222,6 +222,11 @@ impl<K: AutotuneKey> TuneCache<K> {
         // Keep that component boundary: a slash in an identity was a nested legacy directory.
         let path_partial = std::path::PathBuf::from(format!("{device_id}/{name}"));
         for segment in path_partial.iter() {
+            // `Path::iter` yields the root component for an absolute identity; the legacy helper
+            // skipped that component before sanitizing the remaining path segments.
+            if segment == std::ffi::OsStr::new("/") {
+                continue;
+            }
             let segment = segment.to_string_lossy();
             file.push(sanitize_filename::sanitize_with_options(
                 segment,
@@ -431,6 +436,10 @@ mod tests {
             .join("tuner name_1.json.log");
 
         assert_eq!(path, expected);
+
+        let absolute =
+            TuneCache::<String>::legacy_seed_path(root, "tuner name:1", "/device name/1");
+        assert_eq!(absolute, expected);
     }
 
     #[test]
