@@ -1,6 +1,6 @@
 use crate::device::{
     DeviceId, DeviceService, DeviceServiceStage, ServerUtilitiesHandle,
-    handle::{CallError, DeviceHandleSpec, ServiceCreationError},
+    handle::{CallError, DeviceHandleSpec, DeviceServicesShutdownError, ServiceCreationError},
 };
 use core::time::Duration;
 use cubecl_environment::future::channel::oneshot;
@@ -11,11 +11,6 @@ use std::{
     boxed::Box,
     cell::RefCell,
     panic::{AssertUnwindSafe, catch_unwind},
-<<<<<<< HEAD
-    sync::Once,
-=======
-    sync::{Condvar, LazyLock, Mutex},
->>>>>>> 0d10efb1 (fix(runtime): require explicit process shutdown ownership)
     vec::Vec,
 };
 
@@ -272,21 +267,9 @@ impl ServiceState {
     }
 }
 
-<<<<<<< HEAD
-fn shutdown_service_states(states: &mut HashMap<TypeId, ServiceState>, mode: RunnerShutdownMode) {
-    match mode {
-        RunnerShutdownMode::Explicit => {
-            for state in states.values_mut() {
-                state.shutdown();
-            }
-            states.clear();
-        }
-        RunnerShutdownMode::ProcessExit => core::mem::forget(core::mem::take(states)),
-=======
 fn shutdown_service_states(states: &mut HashMap<TypeId, ServiceState>) {
     for state in states.values_mut() {
         state.shutdown();
->>>>>>> 0d10efb1 (fix(runtime): require explicit process shutdown ownership)
     }
     states.clear();
 }
@@ -309,7 +292,6 @@ static RUNNERS: spin::Mutex<Option<HashMap<RunnerId, RunnerEntry>>> = spin::Mute
 /// once per `(DeviceId, TypeId)` pair. This serializes channel creation across all
 /// backends.
 ///
-<<<<<<< HEAD
 /// Lock order is `CHANNELS` then `RUNNERS`, never the reverse.
 static CHANNELS: spin::Mutex<Option<Registry>> = spin::Mutex::new(None);
 
@@ -343,39 +325,6 @@ const SHUTDOWN_JOIN_YIELD_BUDGET: u32 = 1024;
 /// Poll interval once the yield budget is exhausted.
 const SHUTDOWN_JOIN_POLL: Duration = Duration::from_micros(200);
 
-=======
-/// New submissions must stop before this function is called. Runners are shut
-/// down upstream-first so queued producer work is cancelled before downstream
-/// services are dropped.
-pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
-    let _permit = ShutdownPermit::acquire();
-    let channels = CHANNELS.lock().take();
-
-    let mut runners = RUNNERS
-        .lock()
-        .take()
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<Vec<_>>();
-    runners.sort_by_key(|(runner_id, _)| runner_id.stage as u8);
-
-    let mut runner_panics = 0;
-    for (_, runner) in runners {
-        if runner.shutdown().is_err() {
-            runner_panics += 1;
-        }
-    }
-
-    core::mem::drop(channels);
-
-    if runner_panics == 0 {
-        Ok(())
-    } else {
-        Err(DeviceServicesShutdownError::new(runner_panics))
-    }
-}
-
->>>>>>> 0d10efb1 (fix(runtime): require explicit process shutdown ownership)
 impl ChannelDeviceState {
     pub fn init<S: DeviceService>(
         device_id: DeviceId,
@@ -499,10 +448,7 @@ impl ChannelDeviceState {
                 ));
             }
         };
-<<<<<<< HEAD
 
-=======
->>>>>>> 0d10efb1 (fix(runtime): require explicit process shutdown ownership)
         let channel = Self {
             client: device_client,
             service,
@@ -580,12 +526,6 @@ impl DeviceRunner {
 /// rules cannot rule out: a task holding this device's handle parked in *another*
 /// device's unflushed queue, or two runners shutting each other down.
 pub(crate) fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
-    shutdown_device_services_with_mode(RunnerShutdownMode::Explicit)
-}
-
-fn shutdown_device_services_with_mode(
-    mode: RunnerShutdownMode,
-) -> Result<(), DeviceServicesShutdownError> {
     let device_ids = CHANNELS
         .lock()
         .as_ref()
@@ -600,47 +540,12 @@ fn shutdown_device_services_with_mode(
         )
         .collect::<HashSet<_>>();
     for device_id in device_ids {
-        shutdown_device_with_mode(device_id, mode);
+        shutdown_device(device_id);
     }
     Ok(())
 }
 
-#[cfg(unix)]
-unsafe extern "C" {
-    fn atexit(callback: extern "C" fn()) -> core::ffi::c_int;
-}
-
-#[cfg(unix)]
-extern "C" fn shutdown_device_services_at_exit() {
-    let _ = catch_unwind(|| shutdown_device_services_with_mode(RunnerShutdownMode::ProcessExit));
-}
-
-pub(crate) fn register_shutdown_hook() {
-    #[cfg(unix)]
-    {
-        static REGISTERED: Once = Once::new();
-        REGISTERED.call_once(|| {
-            // SAFETY: callback has C ABI, takes no arguments and is process-lifetime valid.
-            let result = unsafe { atexit(shutdown_device_services_at_exit) };
-            assert_eq!(result, 0, "Failed to register device-service shutdown hook");
-        });
-    }
-}
-
-pub(crate) fn register_backend_shutdown_hook() {
-    #[cfg(unix)]
-    {
-        // Keep a separate registration for dynamically loaded backend teardown ordering.
-        // The callback itself is idempotent because the registries are swept on first call.
-        let _ = catch_unwind(|| unsafe { atexit(shutdown_device_services_at_exit) });
-    }
-}
-
 pub(crate) fn shutdown_device(device_id: DeviceId) {
-    shutdown_device_with_mode(device_id, RunnerShutdownMode::Explicit);
-}
-
-fn shutdown_device_with_mode(device_id: DeviceId, mode: RunnerShutdownMode) {
     // A runner joining itself would deadlock. Cycles through another device cannot be
     // caught here, the join timeout is what bounds those.
     SERVER_THREAD.with_borrow(|current| {
@@ -688,9 +593,6 @@ fn shutdown_device_with_mode(device_id: DeviceId, mode: RunnerShutdownMode) {
     drop(channels);
 
     for (runner_id, runner) in runners {
-        if mode == RunnerShutdownMode::ProcessExit {
-            runner.client.process_exit();
-        }
         runner.client.request_shutdown();
         drop(runner.client);
         join_runner(runner_id, runner.thread);
@@ -938,6 +840,7 @@ mod normal_channel {
                 while let Ok(item) = recv.recv() {
                     item()
                 }
+                shutdown();
             });
 
             (
@@ -1070,10 +973,6 @@ mod custom_channel {
             self.state.shutdown.store(true, Ordering::Release);
         }
 
-        fn process_exit(&self) {
-            self.state.process_exit.store(true, Ordering::Release);
-        }
-
         /// Atomically reserves a slot in the buffer and writes the task.
         pub fn enqueue<F: FnOnce() + Send + 'static>(&self, func: F) -> Result<(), CallError> {
             let mut idle_count: u32 = 0;
@@ -1117,8 +1016,6 @@ mod custom_channel {
         /// Set by [`DeviceClient::request_shutdown`]; the server winds down
         /// once it is set and every client is dropped.
         shutdown: AtomicBool,
-        /// Whether service state must be leaked instead of finalized at process exit.
-        process_exit: AtomicBool,
         /// The runner id (for debugging purposes).
         runner_id: RunnerId,
     }
@@ -1159,54 +1056,6 @@ mod custom_channel {
                 .fetch_add(actual_added as u32, Ordering::SeqCst);
         }
 
-<<<<<<< HEAD
-=======
-        /// Stops accepting work, cancels queued tasks, and joins the runner.
-        pub fn shutdown(&self) -> Result<(), ()> {
-            if self.state.accepting.swap(false, Ordering::AcqRel) {
-                while self.state.active_enqueues.load(Ordering::Acquire) != 0 {
-                    std::thread::yield_now();
-                }
-
-                self.state.shutdown_requested.store(true, Ordering::Release);
-            }
-
-            if let Some(join_handle) = self.join_handle.lock().unwrap().take() {
-                join_handle.join().map_err(|_| ())?;
-            }
-
-            Ok(())
-        }
-
-        #[cfg(test)]
-        /// Returns whether the runner still accepts task submissions.
-        pub fn is_accepting(&self) -> bool {
-            self.state.accepting.load(Ordering::Acquire)
-        }
-    }
-
-    struct State {
-        /// Pointer to the current active queue buffer.
-        ///
-        /// Written by the server thread (Release) after swapping buffers,
-        /// read by client threads (Acquire) before writing tasks.
-        queue_ptr: AtomicPtr<Task>,
-        /// Next available index for writing.
-        available_index: AtomicU32,
-        /// Number of tasks successfully written and ready for processing.
-        enqueued_count: AtomicU32,
-        /// Whether clients may enqueue new work.
-        accepting: AtomicBool,
-        /// Number of clients currently writing queue slots.
-        active_enqueues: AtomicU32,
-        /// Whether the server should stop after draining its current task buffer.
-        shutdown_requested: AtomicBool,
-        /// The runner id (for debugging purposes).
-        runner_id: RunnerId,
-    }
-
-    impl State {
->>>>>>> 0d10efb1 (fix(runtime): require explicit process shutdown ownership)
         /// Initializes the task at `index` in the current queue with `func`.
         /// Exclusive access per slot is guaranteed by `available_index.fetch_add`.
         fn init_task_at<F: FnOnce() + Send + 'static>(&self, index: usize, func: F) {
@@ -1259,14 +1108,7 @@ mod custom_channel {
                 queue_ptr: AtomicPtr::new(buffers[0].tasks.as_mut_ptr()),
                 available_index: AtomicU32::new(0),
                 enqueued_count: AtomicU32::new(0),
-<<<<<<< HEAD
                 shutdown: AtomicBool::new(false),
-                process_exit: AtomicBool::new(false),
-=======
-                accepting: AtomicBool::new(true),
-                active_enqueues: AtomicU32::new(0),
-                shutdown_requested: AtomicBool::new(false),
->>>>>>> 0d10efb1 (fix(runtime): require explicit process shutdown ownership)
                 runner_id,
             });
 
@@ -1413,7 +1255,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
     /// A [`MockService`] handle on a device of its own, whose runner is shut down when
     /// the returned value drops.
     fn mock_fixture() -> DeviceFixture<DeviceHandle<MockService, ChannelDeviceHandle>> {
@@ -1421,114 +1262,6 @@ mod tests {
             DeviceHandle::<MockService, ChannelDeviceHandle>::new,
             shutdown_device,
         )
-=======
-    #[test]
-    fn test_shutdown_waits_for_active_task_and_runs_service_shutdown() {
-        let runner_id = RunnerId {
-            device: DeviceId {
-                type_id: 0,
-                index_id: 100,
-            },
-            stage: DeviceServiceStage::Downstream,
-        };
-        let (task_started_tx, task_started_rx) = mpsc::channel();
-        let (task_release_tx, task_release_rx) = mpsc::channel();
-        let (service_shutdown_tx, service_shutdown_rx) = mpsc::channel();
-        let client = custom_channel::DeviceClient::new(
-            runner_id,
-            || {},
-            move || service_shutdown_tx.send(()).unwrap(),
-        );
-
-        client
-            .enqueue(move || {
-                task_started_tx.send(()).unwrap();
-                task_release_rx.recv().unwrap();
-            })
-            .unwrap();
-        client.flush();
-        task_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("task should start");
-
-        let (runner_shutdown_tx, runner_shutdown_rx) = mpsc::channel();
-        let shutdown_client = client.clone();
-        let shutdown_thread = std::thread::spawn(move || {
-            shutdown_client.shutdown().unwrap();
-            runner_shutdown_tx.send(()).unwrap();
-        });
-
-        assert!(
-            runner_shutdown_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "shutdown must wait for the active task"
-        );
-
-        task_release_tx.send(()).unwrap();
-        runner_shutdown_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("runner should finish after the active task");
-        service_shutdown_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("service shutdown should run before the runner exits");
-        shutdown_thread.join().unwrap();
->>>>>>> 0d10efb1 (fix(runtime): require explicit process shutdown ownership)
-    }
-
-    #[test]
-    fn test_shutdown_cancels_buffered_tasks_and_drops_captures() {
-        struct DropSpy(Arc<AtomicUsize>);
-
-        impl Drop for DropSpy {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let runner_id = RunnerId {
-            device: DeviceId {
-                type_id: 0,
-                index_id: 101,
-            },
-            stage: DeviceServiceStage::Downstream,
-        };
-        let (task_started_tx, task_started_rx) = mpsc::channel();
-        let (task_release_tx, task_release_rx) = mpsc::channel();
-        let client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
-
-        client
-            .enqueue(move || {
-                task_started_tx.send(()).unwrap();
-                task_release_rx.recv().unwrap();
-            })
-            .unwrap();
-        client.flush();
-        task_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("task should start");
-
-        let drop_count = Arc::new(AtomicUsize::new(0));
-        let run_count = Arc::new(AtomicUsize::new(0));
-        let spy = DropSpy(Arc::clone(&drop_count));
-        let run_count_task = Arc::clone(&run_count);
-        client
-            .enqueue(move || {
-                let _ = &spy;
-                run_count_task.fetch_add(1, Ordering::SeqCst);
-            })
-            .unwrap();
-
-        let shutdown_client = client.clone();
-        let shutdown_thread = std::thread::spawn(move || shutdown_client.shutdown().unwrap());
-        while client.is_accepting() {
-            std::thread::yield_now();
-        }
-        task_release_tx.send(()).unwrap();
-        shutdown_thread.join().unwrap();
-
-        assert_eq!(run_count.load(Ordering::SeqCst), 0);
-        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

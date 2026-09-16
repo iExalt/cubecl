@@ -27,7 +27,6 @@ pub mod device;
 pub mod device_handle {
     pub use super::device::handle::{
         CallError, CallResultExt, DeviceHandle, DeviceServicesShutdownError,
-        register_device_services_backend_shutdown_hook, register_device_services_shutdown_hook,
         shutdown_device_services,
     };
 }
