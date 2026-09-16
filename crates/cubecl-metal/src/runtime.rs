@@ -124,6 +124,10 @@ impl DeviceService for MetalServer {
         MetalServer::new(metal_device, mem_props.clone(), mem_config, utilities)
     }
 
+    fn shutdown(&mut self) {
+        self.drain_streams();
+    }
+
     fn utilities(&self) -> ServerUtilitiesHandle {
         self.utilities.clone() as ServerUtilitiesHandle
     }

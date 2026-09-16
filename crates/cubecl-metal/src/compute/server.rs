@@ -149,6 +149,24 @@ fn write_pitched(dst: *mut u8, data: &[u8], shape: &[usize], strides: &[usize], 
 }
 
 impl MetalServer {
+    /// Drains every initialized stream before the device service is torn down.
+    ///
+    /// Stream shutdown must flush the active encoder first: dropping it would discard encoded
+    /// work and its temporary buffers. `Server::sync` performs that flush, signals a fence, waits
+    /// for completion, and lets `ResolvedStreams` enqueue deferred resource cleanup.
+    pub(crate) fn drain_streams(&mut self) {
+        let stream_ids = self.streams.stream_ids().collect::<Vec<_>>();
+        for stream_id in stream_ids {
+            if let Err(error) = cubecl_environment::future::block_on(<Self as Server>::sync(
+                self,
+                Vec::new(),
+                stream_id,
+            )) {
+                log::warn!("Metal stream {stream_id:?} failed to drain during shutdown: {error}");
+            }
+        }
+    }
+
     /// Mark every open profile invalid: a failure inside a profiling window
     /// invalidates the measurement. A no-op with no profile open.
     fn profile_failure(&mut self, error: &ServerError) {
