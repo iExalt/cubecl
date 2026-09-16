@@ -526,7 +526,7 @@ impl DeviceRunner {
 /// rules cannot rule out: a task holding this device's handle parked in *another*
 /// device's unflushed queue, or two runners shutting each other down.
 pub(crate) fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
-    let device_ids = CHANNELS
+    let mut device_ids = CHANNELS
         .lock()
         .as_ref()
         .into_iter()
@@ -538,14 +538,22 @@ pub(crate) fn shutdown_device_services() -> Result<(), DeviceServicesShutdownErr
                 .into_iter()
                 .flat_map(|runners| runners.keys().map(|runner| runner.device)),
         )
-        .collect::<HashSet<_>>();
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    device_ids.sort();
+    let mut runner_panics = 0;
     for device_id in device_ids {
-        shutdown_device(device_id);
+        runner_panics += shutdown_device(device_id);
     }
-    Ok(())
+    if runner_panics == 0 {
+        Ok(())
+    } else {
+        Err(DeviceServicesShutdownError::new(runner_panics))
+    }
 }
 
-pub(crate) fn shutdown_device(device_id: DeviceId) {
+pub(crate) fn shutdown_device(device_id: DeviceId) -> usize {
     // A runner joining itself would deadlock. Cycles through another device cannot be
     // caught here, the join timeout is what bounds those.
     SERVER_THREAD.with_borrow(|current| {
@@ -592,10 +600,16 @@ pub(crate) fn shutdown_device(device_id: DeviceId) {
     // before the servers can exit.
     drop(channels);
 
+    // Upstream services may still own work consumed by downstream services, so close
+    // their runners in pipeline order after all cached service handles are detached.
+    runners.sort_by_key(|(runner_id, _)| runner_id.stage as u8);
+    let mut runner_panics = 0;
     for (runner_id, runner) in runners {
         runner.client.request_shutdown();
         drop(runner.client);
-        join_runner(runner_id, runner.thread);
+        if join_runner(runner_id, runner.thread) {
+            runner_panics += 1;
+        }
 
         // Cleared even on a timeout, otherwise every later handle for this device would
         // wait on a runner that is never coming back.
@@ -607,12 +621,13 @@ pub(crate) fn shutdown_device(device_id: DeviceId) {
     // A concurrent `shutdown_device` for the same device may still be joining. This call
     // promises the runners are gone once it returns, so wait that one out too.
     wait_for_device_shutdown(device_id);
+    runner_panics
 }
 
 /// Waits for `thread` to exit, giving up after [`SHUTDOWN_JOIN_TIMEOUT`].
 ///
 /// `JoinHandle::join` has no timed variant, hence the poll on `is_finished`.
-fn join_runner(runner_id: RunnerId, thread: std::thread::JoinHandle<()>) {
+fn join_runner(runner_id: RunnerId, thread: std::thread::JoinHandle<()>) -> bool {
     let start = std::time::Instant::now();
     let mut yields: u32 = 0;
 
@@ -623,7 +638,7 @@ fn join_runner(runner_id: RunnerId, thread: std::thread::JoinHandle<()>) {
                  leaking the thread. Something still holds a client for it: a task parked in \
                  another device's unflushed queue, or two runners shutting each other down."
             );
-            return;
+            return false;
         }
 
         if yields < SHUTDOWN_JOIN_YIELD_BUDGET {
@@ -636,6 +651,9 @@ fn join_runner(runner_id: RunnerId, thread: std::thread::JoinHandle<()>) {
 
     if thread.join().is_err() {
         log::warn!("Device runner {runner_id:?} panicked during shutdown");
+        true
+    } else {
+        false
     }
 }
 
