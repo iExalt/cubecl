@@ -38,6 +38,8 @@ mod input_generator;
 mod key_generator;
 mod local;
 mod log;
+#[cfg(test)]
+mod m0_tests;
 mod operation;
 // Both are the adaptive strategy, which only the native driver can run.
 #[cfg(not(target_family = "wasm"))]
