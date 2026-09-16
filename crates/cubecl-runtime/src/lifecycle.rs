@@ -7,7 +7,7 @@ use cubecl_common::device_handle::{
 pub use cubecl_common::device_handle::{DeviceGenerationMetrics, device_generation_metrics};
 use std::{collections::HashSet, vec::Vec};
 
-use crate::{client::ComputeClient, runtime::Runtime};
+use crate::{client::Client, runtime::Runtime};
 
 static GUARD_ACQUIRED: AtomicBool = AtomicBool::new(false);
 
@@ -96,7 +96,7 @@ impl RuntimeSession {
     }
 
     /// Loads a runtime client and pins its generation in this session.
-    pub fn client<R: Runtime>(&mut self, device: &R::Device) -> ComputeClient<R> {
+    pub fn client<R: Runtime>(&mut self, device: &R::Device) -> Client {
         let client = R::client(device);
         self.pin(&client);
         client
@@ -106,7 +106,7 @@ impl RuntimeSession {
     ///
     /// Returns `true` when this call adds a new generation and `false` when that generation was
     /// already covered or the client has no stateful device-runner generation.
-    pub fn pin<R: Runtime>(&mut self, client: &ComputeClient<R>) -> bool {
+    pub fn pin(&mut self, client: &Client) -> bool {
         let Some(generation_id) = client.generation_id() else {
             return false;
         };
