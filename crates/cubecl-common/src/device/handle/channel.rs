@@ -570,7 +570,7 @@ pub(crate) fn shutdown_device(device_id: DeviceId) -> usize {
     // concurrent `init` observe a half-swept state: clone a client from a `RunnerEntry`
     // that is about to be joined and cache it in the registry, which parks the runner
     // forever since nothing but this function removes that entry.
-    let (channels, runners) = {
+    let (channels, mut runners) = {
         let mut guard_channel = CHANNELS.lock();
         let registry = guard_channel.get_or_insert_with(Registry::default);
 
@@ -622,6 +622,11 @@ pub(crate) fn shutdown_device(device_id: DeviceId) -> usize {
     // promises the runners are gone once it returns, so wait that one out too.
     wait_for_device_shutdown(device_id);
     runner_panics
+}
+
+#[cfg(test)]
+fn shutdown_device_for_fixture(device_id: DeviceId) {
+    let _ = shutdown_device(device_id);
 }
 
 /// Waits for `thread` to exit, giving up after [`SHUTDOWN_JOIN_TIMEOUT`].
@@ -1278,7 +1283,7 @@ mod tests {
     fn mock_fixture() -> DeviceFixture<DeviceHandle<MockService, ChannelDeviceHandle>> {
         DeviceFixture::new(
             DeviceHandle::<MockService, ChannelDeviceHandle>::new,
-            shutdown_device,
+            shutdown_device_for_fixture,
         )
     }
 
@@ -1534,7 +1539,7 @@ mod tests {
         // `INIT_CALLS` is reset and counts towards the single expected init.
         let fixture = DeviceFixture::new(
             DeviceHandle::<CountingService, ChannelDeviceHandle>::new,
-            shutdown_device,
+            shutdown_device_for_fixture,
         );
         let device_id = fixture.device_id();
 
