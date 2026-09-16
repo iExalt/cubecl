@@ -1,5 +1,8 @@
 use super::logger::{LogLevel, LoggerConfig};
 
+#[cfg(std_io)]
+use cubecl_environment::persistence::CacheConfig;
+
 /// Configuration for autotuning in `CubeCL`.
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AutotuneConfig {
@@ -32,7 +35,7 @@ pub struct AutotuneConfig {
     /// written only to the active environment store.
     #[serde(default)]
     #[cfg(std_io)]
-    pub seed_cache: Option<crate::config::cache::CacheConfig>,
+    pub seed_cache: Option<CacheConfig>,
 
     /// Whether to disable the short circuit logic during autotuning.
     #[serde(default)]

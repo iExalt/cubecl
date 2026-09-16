@@ -1054,6 +1054,7 @@ dependencies = [
  "log",
  "pliron",
  "rand 0.10.2",
+ "sanitize-filename",
  "serde",
  "serde_json",
  "serial_test",

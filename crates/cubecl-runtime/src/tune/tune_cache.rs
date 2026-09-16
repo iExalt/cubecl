@@ -1,3 +1,5 @@
+#[cfg(std_io)]
+use alloc::format;
 #[cfg(autotune_persistence)]
 use alloc::vec::Vec;
 
@@ -203,29 +205,43 @@ impl<K: AutotuneKey> TuneCache<K> {
 
     #[cfg(std_io)]
     fn load_seed(name: &str, device_id: &str) -> Option<HashMap<K, (String, usize)>> {
-        use serde::Deserialize;
+        use crate::config::RuntimeConfig;
 
         let root = crate::config::CubeClRuntimeConfig::get()
             .autotune
             .seed_cache
             .as_ref()?
             .root();
+        Self::load_seed_from_path(&Self::legacy_seed_path(&root, name, device_id))
+    }
+
+    #[cfg(std_io)]
+    fn legacy_seed_path(root: &std::path::Path, name: &str, device_id: &str) -> std::path::PathBuf {
         let mut file = root.join("autotune").join(env!("CARGO_PKG_VERSION"));
-        for segment in [device_id, name] {
-            let safe = segment
-                .chars()
-                .map(|ch| {
-                    if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                        ch
-                    } else {
-                        '_'
-                    }
-                })
-                .collect::<String>();
-            file.push(safe);
+        // The old cache accepted a relative `device_id/name` path and sanitized each component.
+        // Keep that component boundary: a slash in an identity was a nested legacy directory.
+        let path_partial = std::path::PathBuf::from(format!("{device_id}/{name}"));
+        for segment in path_partial.iter() {
+            let segment = segment.to_string_lossy();
+            file.push(sanitize_filename::sanitize_with_options(
+                segment,
+                sanitize_filename::Options {
+                    replacement: "_",
+                    ..Default::default()
+                },
+            ));
         }
         file.set_extension("json.log");
-        let bytes = std::fs::read(file).ok()?;
+        file
+    }
+
+    #[cfg(std_io)]
+    fn load_seed_from_path(path: &std::path::Path) -> Option<HashMap<K, (String, usize)>> {
+        use serde::Deserialize;
+
+        // This is intentionally a read rather than Cache::new: loading a readonly seed must not
+        // create an empty legacy file or its parent directories.
+        let bytes = std::fs::read(path).ok()?;
         #[derive(Deserialize)]
         struct Entry<K> {
             key: PersistentCacheKey<K>,
@@ -248,11 +264,35 @@ impl<K: AutotuneKey> TuneCache<K> {
 
     #[cfg(std_io)]
     fn load_seed_into_memory(&mut self) {
-        let Some(seed_cache) = self.seed_cache.take() else {
+        let Some(seed_cache) = self.seed_cache.clone() else {
             return;
         };
         let loaded = seed_cache.len() as u64;
         for (key, (checksum, fastest_index)) in seed_cache {
+            self.merge_hydrated(key.clone(), checksum.clone(), fastest_index);
+        }
+        crate::cache_metrics::record_autotune_seed_entries_loaded(loaded);
+    }
+
+    /// Merge a hydrated entry without clobbering state produced by this process. A writable
+    /// entry is allowed to replace a seed (both are unverified), while a live tune, a locally
+    /// finalized result, or a checksum failure remains authoritative until the next reset.
+    #[cfg(autotune_persistence)]
+    fn merge_hydrated(&mut self, key: K, checksum: String, fastest_index: usize) {
+        let replace = match self.in_memory_cache.get(&key) {
+            None => true,
+            Some(CacheEntry::Pending) => false,
+            Some(CacheEntry::Done {
+                checksum: ChecksumState::Match | ChecksumState::NoMatch,
+                ..
+            }) => false,
+            Some(CacheEntry::Done {
+                checksum: ChecksumState::ToBeVerified(_),
+                ..
+            }) => true,
+        };
+
+        if replace {
             self.in_memory_cache.insert(
                 key,
                 CacheEntry::Done {
@@ -261,7 +301,6 @@ impl<K: AutotuneKey> TuneCache<K> {
                 },
             );
         }
-        crate::cache_metrics::record_autotune_seed_entries_loaded(loaded);
     }
 
     pub fn fastest(&self, key: &K) -> TuneCacheResult {
@@ -338,6 +377,173 @@ impl<K: AutotuneKey> TuneCache<K> {
     }
 }
 
+#[cfg(all(test, std_io, autotune_persistence))]
+mod tests {
+    use super::{CacheEntry, ChecksumState, TuneCache};
+    use crate::tune::TuneCacheResult;
+    use alloc::string::{String, ToString};
+    use alloc::vec;
+    use cubecl_environment::collections::HashMap;
+    use cubecl_environment::persistence::{CacheOption, Namespace, Store, StoreOptions};
+    use std::io::Write;
+
+    fn cache_without_store() -> TuneCache<String> {
+        TuneCache {
+            in_memory_cache: HashMap::new(),
+            persistent_cache: None,
+            seed_cache: Some(HashMap::new()),
+            hydrated: true,
+            generation: cubecl_environment::environment::generation(),
+        }
+    }
+
+    fn cache_with_store() -> TuneCache<String> {
+        TuneCache {
+            in_memory_cache: HashMap::new(),
+            persistent_cache: Some(Store::new(
+                StoreOptions::new()
+                    .storage(Namespace::scoped("autotune-seed-tests", "state"))
+                    .cache(CacheOption::Lazy),
+            )),
+            seed_cache: Some(HashMap::new()),
+            hydrated: true,
+            generation: cubecl_environment::environment::generation(),
+        }
+    }
+
+    struct EnvironmentGuard(String);
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            cubecl_environment::environment::activate(&self.0);
+        }
+    }
+
+    #[test]
+    fn legacy_path_uses_cubecl_filename_sanitization() {
+        let root = std::path::Path::new("/tmp/cubecl-seed-root");
+        let path = TuneCache::<String>::legacy_seed_path(root, "tuner name:1", "device name/1");
+        let expected = root
+            .join("autotune")
+            .join(env!("CARGO_PKG_VERSION"))
+            .join("device name")
+            .join("1")
+            .join("tuner name_1.json.log");
+
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn missing_seed_is_read_only_and_legacy_ndjson_decodes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = TuneCache::<String>::legacy_seed_path(root.path(), "tuner name", "device name");
+        assert!(TuneCache::<String>::load_seed_from_path(&path).is_none());
+        assert!(!path.exists());
+        assert!(!root.path().join("autotune").exists());
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Omit fields added after the legacy format; serde defaults make old seeds decode.
+        let legacy_entry = serde_json::json!({
+            "key": {"key": "operation", "checksum": "legacy-checksum"},
+            "value": {"fastest_index": 4, "results": []}
+        });
+        serde_json::to_writer(&mut file, &legacy_entry).unwrap();
+        writeln!(file).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let entries = TuneCache::<String>::load_seed_from_path(&path).unwrap();
+        assert_eq!(
+            entries.get("operation"),
+            Some(&("legacy-checksum".to_string(), 4))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn writable_hydration_replaces_seed_but_preserves_local_states() {
+        let mut cache = cache_without_store();
+        cache
+            .seed_cache
+            .as_mut()
+            .unwrap()
+            .insert("operation".to_string(), ("seed-checksum".to_string(), 1));
+        cache.load_seed_into_memory();
+        assert!(matches!(
+            cache.fastest(&"operation".to_string()),
+            TuneCacheResult::Unchecked
+        ));
+
+        cache.merge_hydrated("operation".to_string(), "writable-checksum".to_string(), 2);
+        assert!(matches!(
+            cache.fastest(&"operation".to_string()),
+            TuneCacheResult::Unchecked
+        ));
+        assert!(matches!(
+            cache.validate_checksum(&"operation".to_string(), "writable-checksum"),
+            TuneCacheResult::Hit { fastest_index: 2 }
+        ));
+
+        cache.mark_pending("pending".to_string());
+        cache.merge_hydrated("pending".to_string(), "stale-checksum".to_string(), 3);
+        assert!(matches!(
+            cache.fastest(&"pending".to_string()),
+            TuneCacheResult::Pending
+        ));
+
+        cache.cache_insert("final".to_string(), 5);
+        cache.merge_hydrated("final".to_string(), "stale-checksum".to_string(), 6);
+        assert!(matches!(
+            cache.fastest(&"final".to_string()),
+            TuneCacheResult::Hit { fastest_index: 5 }
+        ));
+    }
+
+    #[test]
+    fn invalidated_entries_are_not_replaced_by_stale_hydration() {
+        let mut cache = cache_without_store();
+        cache.merge_hydrated("operation".to_string(), "old-checksum".to_string(), 1);
+        assert!(matches!(
+            cache.validate_checksum(&"operation".to_string(), "new-checksum"),
+            TuneCacheResult::Miss
+        ));
+
+        cache.merge_hydrated("operation".to_string(), "old-checksum".to_string(), 1);
+        assert!(matches!(
+            cache.fastest(&"operation".to_string()),
+            TuneCacheResult::Miss
+        ));
+        assert!(matches!(
+            cache.in_memory_cache.get("operation"),
+            Some(CacheEntry::Done {
+                checksum: ChecksumState::NoMatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn seed_is_reloaded_after_environment_switch() {
+        let _restore = EnvironmentGuard(cubecl_environment::environment::active().to_string());
+        cubecl_environment::environment::activate("seed-cache-test-before");
+        let mut cache = cache_with_store();
+        cache
+            .seed_cache
+            .as_mut()
+            .unwrap()
+            .insert("operation".to_string(), ("seed-checksum".to_string(), 7));
+        cache.load_seed_into_memory();
+        cubecl_environment::environment::activate("seed-cache-test-after");
+        cache.reset_if_environment_switched();
+
+        assert!(matches!(
+            cache.fastest(&"operation".to_string()),
+            TuneCacheResult::Unchecked
+        ));
+    }
+}
+
 #[cfg(autotune_persistence)]
 impl<K: AutotuneKey> TuneCache<K> {
     /// Drops tuning state belonging to a previous environment, so a switch
@@ -363,6 +569,8 @@ impl<K: AutotuneKey> TuneCache<K> {
         self.generation = generation;
         self.in_memory_cache.clear();
         self.hydrated = false;
+        #[cfg(std_io)]
+        self.load_seed_into_memory();
     }
 
     /// Ingest everything the persistent store holds into the in-memory cache,
@@ -380,23 +588,22 @@ impl<K: AutotuneKey> TuneCache<K> {
             return 0;
         }
 
-        let Some(persistent_cache) = self.persistent_cache.as_mut() else {
-            return 0;
+        let mut delivered = 0usize;
+        let mut hydrated = Vec::new();
+        let complete = {
+            let Some(persistent_cache) = self.persistent_cache.as_mut() else {
+                return 0;
+            };
+            persistent_cache.scan(|key, value| {
+                delivered += 1;
+                hydrated.push((key.key, key.checksum, value.fastest_index));
+            })
         };
-
-        let mut delivered = 0;
-        let complete = persistent_cache.scan(|key, value| {
-            delivered += 1;
-            self.in_memory_cache.insert(
-                key.key,
-                CacheEntry::Done {
-                    checksum: ChecksumState::ToBeVerified(key.checksum),
-                    fastest_index: value.fastest_index,
-                },
-            );
-        });
+        for (key, checksum, fastest_index) in hydrated {
+            self.merge_hydrated(key, checksum, fastest_index);
+        }
         self.hydrated = complete;
-        crate::cache_metrics::record_autotune_writable_entries_loaded(delivered);
+        crate::cache_metrics::record_autotune_writable_entries_loaded(delivered as u64);
 
         delivered
     }
