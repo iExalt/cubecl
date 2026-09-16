@@ -453,6 +453,15 @@ impl Drop for ShutdownPermit {
 /// of the runtime and stop creating or using runtime values before shutdown.
 /// Values from a closed generation are invalid and are rejected if reused.
 pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
+    // A runner may still own tasks that initialize or wait on another runner. Joining any
+    // generation synchronously from a runner can therefore deadlock through a cross-device cycle.
+    SERVER_THREAD.with_borrow(|current| {
+        assert!(
+            current.is_none(),
+            "cannot shut down device services from a device runner thread"
+        );
+    });
+
     let permit = ShutdownPermit::acquire();
     let mut runner_panics = 0;
     let downstream_pins = {
@@ -528,6 +537,17 @@ pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
 
 /// Force-closes every service runner for one device, preserving upstream-first ordering.
 pub(crate) fn shutdown_device(device_id: DeviceId) {
+    // A runner joining itself would deadlock. Cycles through another device are bounded by the
+    // runner join path, but this direct case must be rejected before taking the shutdown permit.
+    SERVER_THREAD.with_borrow(|current| {
+        if let Some(runner) = current {
+            assert_ne!(
+                runner.device, device_id,
+                "cannot shut down a device from its own runner thread"
+            );
+        }
+    });
+
     let permit = ShutdownPermit::acquire();
     for stage in [DeviceServiceStage::Upstream, DeviceServiceStage::Downstream] {
         permit.wait_for_initializers();
@@ -1848,6 +1868,42 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("service shutdown should run before the runner exits");
         shutdown_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_shutdown_from_own_runner_is_rejected_and_runner_survives() {
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 1000,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
+        let error = handle
+            .submit_blocking(move |_| {
+                DeviceHandle::<MockService, ChannelDeviceHandle>::shutdown(device_id);
+            })
+            .unwrap_err();
+
+        assert!(error.message().is_some_and(|message| {
+            message.contains("cannot shut down a device from its own runner thread")
+        }));
+        assert_eq!(handle.submit_blocking(|state| state.counter).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_global_shutdown_from_runner_is_rejected_and_runner_survives() {
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 1001,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
+        let error = handle
+            .submit_blocking(|_| shutdown_device_services().unwrap())
+            .unwrap_err();
+
+        assert!(error.message().is_some_and(|message| {
+            message.contains("cannot shut down device services from a device runner thread")
+        }));
+        assert_eq!(handle.submit_blocking(|state| state.counter).unwrap(), 0);
     }
 
     #[test]

@@ -289,9 +289,9 @@ impl<S: ?Sized + 'static, I: DeviceHandleSpec> DeviceHandle<S, I> {
         self.handle.exclusive(task)
     }
 
-    /// Stops the background runner threads for `device_id`, blocking until they
-    /// exit. Queued tasks run before the threads stop. Live handles keep their
-    /// runner alive, so all handles for the device should be dropped first.
+    /// Force-closes all background runner generations for `device_id`, blocking until they
+    /// exit. Queued tasks run before the threads stop. This invalidates live handles and values
+    /// retained from those generations; callers must stop using them before shutdown.
     ///
     /// Only meaningful for handle implementations with background threads; a
     /// no-op otherwise.
