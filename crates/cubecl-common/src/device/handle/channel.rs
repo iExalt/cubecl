@@ -1,8 +1,9 @@
 use crate::device::{
     DeviceId, DeviceService, DeviceServiceStage, ServerUtilitiesHandle,
-    handle::{CallError, DeviceHandleSpec, DeviceServicesShutdownError, ServiceCreationError},
+    handle::{
+        CallError, DeviceHandleSpec, DeviceLease, DeviceServicesShutdownError, ServiceCreationError,
+    },
 };
-use core::time::Duration;
 use cubecl_environment::future::channel::oneshot;
 use cubecl_environment::stream::StreamId;
 use hashbrown::{HashMap, HashSet};
@@ -10,11 +11,26 @@ use std::{
     any::{Any, TypeId},
     boxed::Box,
     cell::RefCell,
+    ops::Deref,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, Condvar, LazyLock, Mutex, Weak},
     vec::Vec,
 };
 
-use custom_channel::DeviceClient;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+pub(super) use custom_channel::ExternalLease;
+use custom_channel::{DeviceClient, GenerationCloser, GenerationUpgrade, WeakDeviceClient};
+
+static CREATED_GENERATIONS: AtomicU64 = AtomicU64::new(0);
+static CLOSED_GENERATIONS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn generation_metrics() -> (u64, u64) {
+    (
+        CREATED_GENERATIONS.load(AtomicOrdering::Relaxed),
+        CLOSED_GENERATIONS.load(AtomicOrdering::Relaxed),
+    )
+}
 
 // For debugging and benchmarking.
 //
@@ -64,6 +80,14 @@ impl DeviceHandleSpec for ChannelDeviceHandle {
         self.state.utilities()
     }
 
+    fn lease(&self) -> DeviceLease {
+        DeviceLease::channel(self.state.client.external_lease())
+    }
+
+    fn shutdown(device_id: DeviceId) {
+        let _ = shutdown_device(device_id);
+    }
+
     /// Runs `task` on the device thread, blocking until it returns.
     fn submit_blocking<'a, R: Send, T: FnOnce(&mut dyn Any) -> R + Send + 'a>(
         &self,
@@ -92,10 +116,6 @@ impl DeviceHandleSpec for ChannelDeviceHandle {
         let current = StreamId::current();
         self.run_scoped(move || current.executes(task))
     }
-
-    fn shutdown(device_id: DeviceId) {
-        shutdown_device(device_id);
-    }
 }
 
 const SEND_FLUSH: bool = true;
@@ -111,9 +131,7 @@ impl ChannelDeviceHandle {
 
         let current = StreamId::current();
 
-        let func_init = move || {
-            state.act_on(|state| current.executes(|| task(state.as_mut())));
-        };
+        let func_init = move || state.act_on(|state| current.executes(|| task(state.as_mut())));
 
         self.send::<_, FLUSH>(func_init)
     }
@@ -129,18 +147,13 @@ impl ChannelDeviceHandle {
         /// Builds a `'static` shim that consumes `*slot` on the device
         /// thread. The caller has to keep `*slot` alive until the shim has run,
         /// `run_scoped` does this by blocking on `recv.recv()`.
-        ///
-        /// The task runs in its own frame and the outcome is sent from the one
-        /// above: references into the caller's frame stay protected for as long
-        /// as the call holding them runs, so sending any earlier would let the
-        /// caller pop that frame while a protector is still live.
         fn create_shim<R: Send, F: FnOnce() -> R + Send>(
             slot: &mut Option<(F, oneshot::Sender<Outcome<R>>)>,
         ) -> impl FnOnce() + Send + 'static {
             // `*mut ()` so the shim is `'static`.
             struct Ptr(*mut ());
-            // SAFETY: pointee is `Send` by the bounds on `F` and `R`;
-            // uniqueness of access is upheld by the deref below.
+            // SAFETY: pointee is `Send` by the bound on `W`; uniqueness of
+            // access is upheld by the deref below.
             unsafe impl Send for Ptr {}
 
             let ptr = Ptr(slot as *mut _ as *mut ());
@@ -169,8 +182,6 @@ impl ChannelDeviceHandle {
         match recv.recv() {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(payload)) => Err(CallError::from_panic(payload)),
-            // The sender was dropped without sending (e.g. the runner thread died)
-            // so no panic payload is available.
             Err(_) => Err(CallError::disconnected()),
         }
     }
@@ -184,7 +195,6 @@ impl ChannelDeviceHandle {
         task: T,
     ) -> Result<(), CallError> {
         if is_device_runner_thread(self.state.client.runner_id()) {
-            // Capture the panic payload so it surfaces in the returned `CallError`.
             if let Err(payload) = catch_unwind(AssertUnwindSafe(task)) {
                 let err = CallError::from_panic(payload);
                 log::warn!("Task failed: {err:?}");
@@ -208,11 +218,6 @@ fn is_device_runner_thread(runner_key: &RunnerId) -> bool {
     SERVER_THREAD.with_borrow(|state| state.as_ref() == Some(runner_key))
 }
 
-/// Whether the current thread is a runner for `device_id`, on any stage.
-fn is_device_thread(device_id: DeviceId) -> bool {
-    SERVER_THREAD.with_borrow(|state| state.as_ref().is_some_and(|id| id.device == device_id))
-}
-
 std::thread_local! {
     /// The ID of the device this thread is responsible for.
     static SERVER_THREAD: RefCell<Option<RunnerId>> = const { RefCell::new(None) };
@@ -228,8 +233,20 @@ struct DeviceRunner {}
 /// A simple wrapper over a client and a service that is cached with [`CHANNELS`].
 #[derive(Clone)]
 struct ChannelDeviceState {
+    inner: Arc<ChannelDeviceStateInner>,
+}
+
+struct ChannelDeviceStateInner {
     client: DeviceClient,
     service: ChannelService,
+}
+
+impl Deref for ChannelDeviceState {
+    type Target = ChannelDeviceStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 /// Cached reference to a device service's state.
@@ -244,6 +261,7 @@ struct ChannelService {
 
 struct ServiceState {
     service: RefCell<Box<dyn Any + 'static>>,
+    utilities: ServerUtilitiesHandle,
     shutdown: fn(&mut Box<dyn Any + 'static>),
 }
 
@@ -256,8 +274,10 @@ impl ServiceState {
                 .shutdown();
         }
 
+        let utilities = service.utilities();
         Self {
             service: RefCell::new(Box::new(service)),
+            utilities,
             shutdown: shutdown::<S>,
         }
     }
@@ -280,50 +300,273 @@ struct RunnerId {
     stage: DeviceServiceStage,
 }
 
-/// A registered runner: the client used to reach it plus the join handle of
-/// its server thread, kept so [`shutdown_device`] can wait for the exit.
-struct RunnerEntry {
-    client: DeviceClient,
-    thread: std::thread::JoinHandle<()>,
+enum RunnerRegistryEntry {
+    Strong(DeviceClient),
+    Weak(WeakDeviceClient),
 }
 
-static RUNNERS: spin::Mutex<Option<HashMap<RunnerId, RunnerEntry>>> = spin::Mutex::new(None);
+impl RunnerRegistryEntry {
+    fn new(client: &DeviceClient) -> Self {
+        if strong_device_registries() {
+            Self::Strong(client.clone())
+        } else {
+            Self::Weak(client.downgrade())
+        }
+    }
+
+    fn upgrade(&self) -> GenerationUpgrade {
+        match self {
+            Self::Strong(client) => client.try_clone_generation(),
+            Self::Weak(client) => client.upgrade(),
+        }
+    }
+
+    fn closer(&self) -> Option<GenerationCloser> {
+        match self {
+            Self::Strong(client) => Some(client.closer()),
+            Self::Weak(client) => client.closer(),
+        }
+    }
+}
+
+enum ChannelRegistryEntry {
+    Strong(ChannelDeviceState),
+    Weak(Weak<ChannelDeviceStateInner>),
+}
+
+impl ChannelRegistryEntry {
+    fn new(state: &ChannelDeviceState) -> Self {
+        if strong_device_registries() {
+            Self::Strong(state.clone())
+        } else {
+            Self::Weak(Arc::downgrade(&state.inner))
+        }
+    }
+
+    fn upgrade(&self) -> Option<ChannelDeviceState> {
+        match self {
+            Self::Strong(state) => Some(state.clone()),
+            Self::Weak(state) => state.upgrade().map(|inner| ChannelDeviceState { inner }),
+        }
+    }
+}
+
+static STRONG_DEVICE_REGISTRIES: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("CUBECL_STRONG_DEVICE_REGISTRIES").is_some());
+
+fn strong_device_registries() -> bool {
+    *STRONG_DEVICE_REGISTRIES
+}
+
+static RUNNERS: spin::Mutex<Option<HashMap<RunnerId, RunnerRegistryEntry>>> =
+    spin::Mutex::new(None);
 /// Device/service map. The lock is held across the entire `init` sequence so `S::init` runs
 /// once per `(DeviceId, TypeId)` pair. This serializes channel creation across all
 /// backends.
-///
-/// Lock order is `CHANNELS` then `RUNNERS`, never the reverse.
-static CHANNELS: spin::Mutex<Option<Registry>> = spin::Mutex::new(None);
+static CHANNELS: spin::Mutex<Option<HashMap<(RunnerId, TypeId), ChannelRegistryEntry>>> =
+    spin::Mutex::new(None);
 
-/// The cached device/service states, plus the runners currently being wound down.
-///
-/// One lock covers both because [`ChannelDeviceState::init`] and [`shutdown_device`] have
-/// to agree on a single ordering: a shutdown that swept the map has to be visible to
-/// every `init` that has not yet inserted into it. Sharing the lock `init` already takes
-/// also means the check costs it a set lookup rather than another acquisition, and
-/// handle creation is warm enough to care.
 #[derive(Default)]
-struct Registry {
-    /// Cached state per `(RunnerId, TypeId)`.
-    channels: HashMap<(RunnerId, TypeId), ChannelDeviceState>,
-    /// Runners [`shutdown_device`] has swept out of both registries but not yet joined.
-    /// An `init` that lands on one waits for the join instead of caching a client of a
-    /// runner that is about to go away, which would park it forever, or spawning a
-    /// second runner with the same [`RunnerId`] while the first is still draining.
-    shutting_down: HashSet<RunnerId>,
+struct LifecycleState {
+    active_initializers: usize,
+    shutting_down: bool,
 }
 
-/// How long [`shutdown_device`] waits for a runner thread before giving up on it.
+static LIFECYCLE: LazyLock<(Mutex<LifecycleState>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(LifecycleState::default()), Condvar::new()));
+
+struct InitializationPermit;
+
+impl InitializationPermit {
+    fn acquire(target_stage: DeviceServiceStage) -> Self {
+        let caller_stage = SERVER_THREAD.with_borrow(|runner| runner.map(|id| id.stage));
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        while lifecycle.shutting_down {
+            match caller_stage {
+                Some(caller_stage) if (caller_stage as u8) < (target_stage as u8) => break,
+                Some(caller_stage) => {
+                    drop(lifecycle);
+                    panic!(
+                        "device runner at stage {caller_stage:?} cannot initialize stage \
+                         {target_stage:?} during shutdown"
+                    );
+                }
+                None => lifecycle = condition.wait(lifecycle).unwrap(),
+            }
+        }
+        lifecycle.active_initializers += 1;
+        Self
+    }
+}
+
+impl Drop for InitializationPermit {
+    fn drop(&mut self) {
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        lifecycle.active_initializers -= 1;
+        condition.notify_all();
+    }
+}
+
+struct ShutdownPermit;
+
+impl ShutdownPermit {
+    fn acquire() -> Self {
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        while lifecycle.shutting_down {
+            lifecycle = condition.wait(lifecycle).unwrap();
+        }
+        lifecycle.shutting_down = true;
+        while lifecycle.active_initializers != 0 {
+            lifecycle = condition.wait(lifecycle).unwrap();
+        }
+        Self
+    }
+
+    fn wait_for_initializers(&self) {
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        while lifecycle.active_initializers != 0 {
+            lifecycle = condition.wait(lifecycle).unwrap();
+        }
+    }
+}
+
+impl Drop for ShutdownPermit {
+    fn drop(&mut self) {
+        let (mutex, condition) = &*LIFECYCLE;
+        let mut lifecycle = mutex.lock().unwrap();
+        lifecycle.shutting_down = false;
+        condition.notify_all();
+    }
+}
+
+/// Stops and joins every device runner.
 ///
-/// A runner only exits once every client is gone, so a task parked in another device's
-/// queue, or a cycle between two runners shutting each other down, can hold it forever.
-/// Leaking the thread with a warning beats hanging the process with no diagnostic.
-const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-/// Number of `yield_now` calls before the join wait drops to sleeping, so a normal
-/// shutdown still returns promptly.
-const SHUTDOWN_JOIN_YIELD_BUDGET: u32 = 1024;
-/// Poll interval once the yield budget is exhausted.
-const SHUTDOWN_JOIN_POLL: Duration = Duration::from_micros(200);
+/// Runners are shut down upstream-first so accepted producer work is drained
+/// before downstream services are closed.
+///
+/// This force-closes every registered runtime generation, even when external
+/// clients or resources remain alive. Callers must have sole process ownership
+/// of the runtime and stop creating or using runtime values before shutdown.
+/// Values from a closed generation are invalid and are rejected if reused.
+pub fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
+    let permit = ShutdownPermit::acquire();
+    let mut runner_panics = 0;
+    let downstream_pins = {
+        let guard = RUNNERS.lock();
+        guard
+            .as_ref()
+            .into_iter()
+            .flat_map(HashMap::iter)
+            .filter_map(|(runner_id, entry)| {
+                if runner_id.stage != DeviceServiceStage::Downstream {
+                    return None;
+                }
+                match entry.upgrade() {
+                    GenerationUpgrade::Ready(client) => Some(client),
+                    GenerationUpgrade::Closing(_) | GenerationUpgrade::Gone => None,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for stage in [DeviceServiceStage::Upstream, DeviceServiceStage::Downstream] {
+        permit.wait_for_initializers();
+
+        {
+            let mut guard = CHANNELS.lock();
+            let channels = guard.get_or_insert_with(HashMap::new);
+            let keys = channels
+                .keys()
+                .filter_map(|(runner_id, type_id)| {
+                    (runner_id.stage == stage).then_some((*runner_id, *type_id))
+                })
+                .collect::<Vec<_>>();
+
+            for key in keys {
+                channels.remove(&key);
+            }
+        }
+
+        let closers = {
+            let mut guard = RUNNERS.lock();
+            let runners = guard.get_or_insert_with(HashMap::new);
+            let keys = runners
+                .keys()
+                .filter(|runner_id| runner_id.stage == stage)
+                .copied()
+                .collect::<Vec<_>>();
+
+            keys.into_iter()
+                .filter_map(|key| runners.remove(&key))
+                .filter_map(|entry| entry.closer())
+                .collect::<Vec<_>>()
+        };
+
+        let mut closed = HashSet::new();
+        for closer in closers {
+            if !closed.insert(closer.generation_id()) {
+                continue;
+            }
+            if closer.shutdown().is_err() {
+                runner_panics += 1;
+            }
+        }
+    }
+
+    core::mem::drop(downstream_pins);
+
+    if runner_panics == 0 {
+        Ok(())
+    } else {
+        Err(DeviceServicesShutdownError::new(runner_panics))
+    }
+}
+
+/// Force-closes every service runner for one device, preserving upstream-first ordering.
+pub(crate) fn shutdown_device(device_id: DeviceId) {
+    let permit = ShutdownPermit::acquire();
+    for stage in [DeviceServiceStage::Upstream, DeviceServiceStage::Downstream] {
+        permit.wait_for_initializers();
+        {
+            let mut guard = CHANNELS.lock();
+            if let Some(channels) = guard.as_mut() {
+                channels.retain(|(runner_id, _), _| {
+                    !(runner_id.device == device_id && runner_id.stage == stage)
+                });
+            }
+        }
+        let closers = {
+            let mut guard = RUNNERS.lock();
+            guard
+                .as_mut()
+                .into_iter()
+                .flat_map(|runners| {
+                    let keys = runners
+                        .keys()
+                        .filter(|runner_id| {
+                            runner_id.device == device_id && runner_id.stage == stage
+                        })
+                        .copied()
+                        .collect::<Vec<_>>();
+                    keys.into_iter()
+                        .filter_map(|key| runners.remove(&key))
+                        .filter_map(|entry| entry.closer())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut closed = HashSet::new();
+        for closer in closers {
+            if closed.insert(closer.generation_id()) {
+                let _ = closer.shutdown();
+            }
+        }
+    }
+}
 
 impl ChannelDeviceState {
     pub fn init<S: DeviceService>(
@@ -335,128 +578,127 @@ impl ChannelDeviceState {
             device: device_id,
             stage: S::stage(),
         };
+        let _permit = InitializationPermit::acquire(runner_id.stage);
         let key = (runner_id, type_id);
 
-        // Hold the `CHANNELS` lock across the entire init sequence so that the
-        // "check missing, insert new" transition is atomic. Without this, two
-        // concurrent callers for the same key would both observe a missing entry,
-        // both run `S::init`, and race to insert.
-        //
-        // Taking the lock also means waiting out any in-flight `shutdown_device` for
-        // this runner. The check belongs under the lock: `shutdown_device` marks the
-        // runner while holding it, so testing it here is what closes the window where
-        // we would otherwise cache a client of a runner that is already being joined,
-        // parking that runner forever.
-        let mut guard_channel = loop {
-            let mut guard = CHANNELS.lock();
-            let shutting_down = guard
-                .get_or_insert_with(Registry::default)
-                .shutting_down
-                .contains(&runner_id);
+        loop {
+            // Hold `CHANNELS` across runner lookup and service initialization so concurrent callers
+            // can't initialize the same `(RunnerId, TypeId)` twice.
+            let mut guard_channel = CHANNELS.lock();
+            let channels = guard_channel.get_or_insert_with(HashMap::new);
 
-            if !shutting_down {
-                break guard;
+            if let Some(existing) = channels.get(&key).and_then(ChannelRegistryEntry::upgrade) {
+                if existing.client.is_active() {
+                    if service.is_some() {
+                        return Err(ServiceCreationError::new(
+                            "Service already initialized.".into(),
+                        ));
+                    }
+                    return Ok(existing);
+                }
+                channels.remove(&key);
             }
 
-            if is_device_thread(runner_id.device) {
-                // Waiting is not an option: the shutdown covers every runner of this
-                // device, including the one running this very code, and it cannot finish
-                // until we return. Device-scoped for the same reason the self-join assert
-                // in `shutdown_device` is: the runners of a device are joined in an
-                // unspecified order, so waiting on a sibling stage can deadlock too.
-                return Err(ServiceCreationError::new(
-                    "Cannot create a device handle from a runner thread of a device that \
-                     is shutting down."
-                        .into(),
-                ));
-            }
+            // A single device runner can serve multiple [`DeviceService`]. Re-read after every
+            // close wait so concurrent waiters observe a replacement installed by another caller.
+            let device_client = {
+                let mut guard = RUNNERS.lock();
+                let runners = guard.get_or_insert_with(HashMap::new);
+                let upgrade = runners
+                    .get(&runner_id)
+                    .map(RunnerRegistryEntry::upgrade)
+                    .unwrap_or(GenerationUpgrade::Gone);
+                match upgrade {
+                    GenerationUpgrade::Ready(client) => Ok(client),
+                    GenerationUpgrade::Closing(waiter) => Err(waiter),
+                    GenerationUpgrade::Gone => {
+                        let client = DeviceRunner::start(runner_id);
+                        runners.insert(runner_id, RunnerRegistryEntry::new(&client));
+                        Ok(client)
+                    }
+                }
+            };
 
-            drop(guard);
-            std::thread::yield_now();
-        };
-        let channels = &mut guard_channel.get_or_insert_with(Registry::default).channels;
+            let device_client = match device_client {
+                Ok(client) => client,
+                Err(waiter) => {
+                    drop(guard_channel);
+                    waiter.wait_closed();
+                    continue;
+                }
+            };
 
-        if let Some(existing) = channels.get(&key) {
-            if service.is_some() {
-                // `insert(device, service)` cannot replace an existing state.
-                return Err(ServiceCreationError::new(
-                    "Service already initialized.".into(),
-                ));
-            }
-            return Ok(existing.clone());
-        }
+            let (callback, recv) = oneshot::channel();
 
-        // A single device runner can serve multiple [`DeviceService`].
-        let device_client = {
-            let mut guard = RUNNERS.lock();
-            let runners = guard.get_or_insert_with(HashMap::new);
-            runners
-                .entry(runner_id)
-                .or_insert_with(|| DeviceRunner::start(runner_id))
-                .client
-                .clone()
-        };
+            // The service initialization function.
+            let initialize_service = move || {
+                STATES.with(|state| {
+                    let mut map = match state.try_borrow_mut() {
+                        Ok(map) => map,
+                        Err(err) => panic!(
+                            "The device service {:?} is already borrowed: {err}",
+                            core::any::type_name::<S>()
+                        ),
+                    };
 
-        let (callback, recv) = oneshot::channel();
+                    if let Some(existing) = map.get(&type_id) {
+                        if service.is_some() {
+                            callback.send(Err(())).unwrap();
+                        } else {
+                            callback
+                                .send(Ok(ChannelService {
+                                    type_id,
+                                    utilities: existing.utilities.clone(),
+                                }))
+                                .unwrap();
+                        }
+                        return;
+                    }
 
-        // The service initialization function.
-        let initialize_service = move || {
-            STATES.with(|state| {
-                let mut map = match state.try_borrow_mut() {
-                    Ok(map) => map,
-                    Err(err) => panic!(
-                        "The device service {:?} is already borrowed: {err}",
-                        core::any::type_name::<S>()
-                    ),
-                };
-
-                if service.is_some() && map.contains_key(&type_id) {
-                    callback.send(Err(())).unwrap();
-                } else {
                     let service = service.unwrap_or_else(|| S::init(device_id));
-                    let utilities = service.utilities();
-
-                    map.entry(type_id)
-                        .or_insert_with(|| ServiceState::new(service));
+                    let state = ServiceState::new(service);
+                    let utilities = state.utilities.clone();
+                    map.insert(type_id, state);
                     callback
                         .send(Ok(ChannelService { type_id, utilities }))
                         .unwrap();
-                }
-            });
-        };
-
-        // Same reason in [`send]` we need to call the function directly if we are on the runner
-        // thread.
-        if is_device_runner_thread(&runner_id) {
-            if let Err(err) = catch_unwind(AssertUnwindSafe(initialize_service)) {
-                return Err(ServiceCreationError::new(std::format!(
-                    "Service initialization failed: {err:?}"
-                )));
+                });
             };
-        } else {
-            device_client.enqueue(initialize_service).unwrap();
-            device_client.flush();
-        };
 
-        let service = recv.recv().unwrap();
+            // Same reason in [`send]` we need to call the function directly if we are on the runner
+            // thread.
+            if is_device_runner_thread(&runner_id) {
+                if let Err(err) = catch_unwind(AssertUnwindSafe(initialize_service)) {
+                    return Err(ServiceCreationError::new(std::format!(
+                        "Service initialization failed: {err:?}"
+                    )));
+                };
+            } else {
+                device_client.enqueue(initialize_service).unwrap();
+                device_client.flush();
+            };
 
-        let service = match service {
-            Ok(service) => service,
-            Err(_) => {
-                return Err(ServiceCreationError::new(
-                    "Service already initialized.".into(),
-                ));
-            }
-        };
+            let service = recv.recv().unwrap();
 
-        let channel = Self {
-            client: device_client,
-            service,
-        };
+            let service = match service {
+                Ok(service) => service,
+                Err(_) => {
+                    return Err(ServiceCreationError::new(
+                        "Service already initialized.".into(),
+                    ));
+                }
+            };
+            let channel = Self {
+                inner: Arc::new(ChannelDeviceStateInner {
+                    client: device_client,
+                    service,
+                }),
+            };
 
-        channels.insert(key, channel.clone());
+            channels.insert(key, ChannelRegistryEntry::new(&channel));
 
-        Ok(channel)
+            return Ok(channel);
+        }
     }
 
     fn utilities(&self) -> ServerUtilitiesHandle {
@@ -480,11 +722,10 @@ impl ChannelService {
 }
 
 impl DeviceRunner {
-    /// Spawns a new thread, marks it with the `device_id`, and returns the
-    /// client together with the thread's join handle.
-    pub fn start(runner_id: RunnerId) -> RunnerEntry {
+    /// Spawns a new thread, marks it with the `device_id`, and returns a `DeviceClient`.
+    pub fn start(runner_id: RunnerId) -> DeviceClient {
         let (sender_init, recv_init) = oneshot::channel();
-        let (client, thread) = DeviceClient::new(
+        let channel = DeviceClient::new(
             runner_id,
             move || {
                 SERVER_THREAD.with_borrow_mut(|cell| *cell = Some(runner_id));
@@ -501,194 +742,7 @@ impl DeviceRunner {
             panic!("Failed to synchronize device runner thread initialization");
         }
 
-        RunnerEntry { client, thread }
-    }
-}
-
-/// Stops every runner thread of `device_id`, blocking until they exit.
-///
-/// Queued tasks run before the threads stop. Live handles keep their runner alive, so
-/// this blocks until the last handle for the device is dropped. New handles created for
-/// the device afterwards spawn fresh runner threads.
-///
-/// # Scope
-///
-/// This is device-wide, not service-wide: it tears down *every* [`DeviceService`] on
-/// `device_id` and both [`DeviceServiceStage`]s, not just the service the caller went
-/// through. [`DeviceId`] is also not unique across runtimes, `type_id` is assigned per
-/// runtime, so two backends can name the same id. Shutting down "device 0" therefore
-/// reaches every service any runtime registered under that id.
-///
-/// # Notes
-///
-/// If a runner does not stop within [`SHUTDOWN_JOIN_TIMEOUT`] the thread is leaked with a
-/// warning rather than blocking forever. That bounds the failure modes the ownership
-/// rules cannot rule out: a task holding this device's handle parked in *another*
-/// device's unflushed queue, or two runners shutting each other down.
-pub(crate) fn shutdown_device_services() -> Result<(), DeviceServicesShutdownError> {
-    let mut device_ids = CHANNELS
-        .lock()
-        .as_ref()
-        .into_iter()
-        .flat_map(|registry| registry.channels.keys().map(|(runner, _)| runner.device))
-        .chain(
-            RUNNERS
-                .lock()
-                .as_ref()
-                .into_iter()
-                .flat_map(|runners| runners.keys().map(|runner| runner.device)),
-        )
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    device_ids.sort();
-    let mut runner_panics = 0;
-    for device_id in device_ids {
-        runner_panics += shutdown_device(device_id);
-    }
-    if runner_panics == 0 {
-        Ok(())
-    } else {
-        Err(DeviceServicesShutdownError::new(runner_panics))
-    }
-}
-
-pub(crate) fn shutdown_device(device_id: DeviceId) -> usize {
-    // A runner joining itself would deadlock. Cycles through another device cannot be
-    // caught here, the join timeout is what bounds those.
-    SERVER_THREAD.with_borrow(|current| {
-        if let Some(runner) = current {
-            assert_ne!(
-                runner.device, device_id,
-                "cannot shut down a device from its own runner thread"
-            );
-        }
-    });
-
-    // Both registries are swept under both locks, and the runners are marked as shutting
-    // down before either lock is released. A gap between the sweeps would let a
-    // concurrent `init` observe a half-swept state: clone a client from a `RunnerEntry`
-    // that is about to be joined and cache it in the registry, which parks the runner
-    // forever since nothing but this function removes that entry.
-    let (channels, mut runners) = {
-        let mut guard_channel = CHANNELS.lock();
-        let registry = guard_channel.get_or_insert_with(Registry::default);
-
-        let runners: Vec<(RunnerId, RunnerEntry)> = match RUNNERS.lock().as_mut() {
-            Some(map) => map
-                .extract_if(|runner_id, _| runner_id.device == device_id)
-                .collect(),
-            None => Vec::new(),
-        };
-
-        let channels: Vec<ChannelDeviceState> = registry
-            .channels
-            .extract_if(|(runner_id, _), _| runner_id.device == device_id)
-            .map(|(_, state)| state)
-            .collect();
-
-        // Marked before the lock is released, so an `init` racing with this sweep either
-        // got in before it, and its entry is in `channels` above, or waits for the join.
-        for (runner_id, _) in runners.iter() {
-            registry.shutting_down.insert(*runner_id);
-        }
-
-        (channels, runners)
-    };
-
-    // Dropped outside the locks: each cached state holds a client clone that must go away
-    // before the servers can exit.
-    drop(channels);
-
-    // Upstream services may still own work consumed by downstream services, so close
-    // their runners in pipeline order after all cached service handles are detached.
-    runners.sort_by_key(|(runner_id, _)| runner_id.stage as u8);
-    let mut runner_panics = 0;
-    for (runner_id, runner) in runners {
-        runner.client.request_shutdown();
-        drop(runner.client);
-        if join_runner(runner_id, runner.thread) {
-            runner_panics += 1;
-        }
-
-        // Cleared even on a timeout, otherwise every later handle for this device would
-        // wait on a runner that is never coming back.
-        if let Some(registry) = CHANNELS.lock().as_mut() {
-            registry.shutting_down.remove(&runner_id);
-        }
-    }
-
-    // A concurrent `shutdown_device` for the same device may still be joining. This call
-    // promises the runners are gone once it returns, so wait that one out too.
-    wait_for_device_shutdown(device_id);
-    runner_panics
-}
-
-#[cfg(test)]
-fn shutdown_device_for_fixture(device_id: DeviceId) {
-    let _ = shutdown_device(device_id);
-}
-
-/// Waits for `thread` to exit, giving up after [`SHUTDOWN_JOIN_TIMEOUT`].
-///
-/// `JoinHandle::join` has no timed variant, hence the poll on `is_finished`.
-fn join_runner(runner_id: RunnerId, thread: std::thread::JoinHandle<()>) -> bool {
-    let start = std::time::Instant::now();
-    let mut yields: u32 = 0;
-
-    while !thread.is_finished() {
-        if start.elapsed() >= SHUTDOWN_JOIN_TIMEOUT {
-            log::warn!(
-                "Device runner {runner_id:?} did not stop within {SHUTDOWN_JOIN_TIMEOUT:?}, \
-                 leaking the thread. Something still holds a client for it: a task parked in \
-                 another device's unflushed queue, or two runners shutting each other down."
-            );
-            return false;
-        }
-
-        if yields < SHUTDOWN_JOIN_YIELD_BUDGET {
-            std::thread::yield_now();
-            yields += 1;
-        } else {
-            std::thread::sleep(SHUTDOWN_JOIN_POLL);
-        }
-    }
-
-    if thread.join().is_err() {
-        log::warn!("Device runner {runner_id:?} panicked during shutdown");
-        true
-    } else {
-        false
-    }
-}
-
-/// Blocks while any runner of `device_id` is still being wound down, by this call or a
-/// concurrent one. Bounded by the same timeout as the join it is waiting on, doubled so a
-/// timing-out joiner gets to clear its own mark first.
-fn wait_for_device_shutdown(device_id: DeviceId) {
-    let start = std::time::Instant::now();
-
-    loop {
-        let pending = CHANNELS.lock().as_ref().is_some_and(|registry| {
-            registry
-                .shutting_down
-                .iter()
-                .any(|runner_id| runner_id.device == device_id)
-        });
-
-        if !pending {
-            return;
-        }
-
-        if start.elapsed() >= SHUTDOWN_JOIN_TIMEOUT * 2 {
-            log::warn!(
-                "A concurrent shutdown of {device_id:?} is still in flight after \
-                 {SHUTDOWN_JOIN_TIMEOUT:?}, returning anyway."
-            );
-            return;
-        }
-
-        std::thread::sleep(SHUTDOWN_JOIN_POLL);
+        channel
     }
 }
 
@@ -712,7 +766,7 @@ mod task {
     pub const GLOBAL_TASK_MAX_SIZE: usize = 4096;
 
     /// The maximum size of a closure that can be stored using inlined memory.
-    const INLINE_TASK_MAX_SIZE: usize = 48;
+    const INLINE_TASK_MAX_SIZE: usize = 40;
 
     /// One arena slot. `#[repr(C, align(64))]` makes every slot 64-byte
     /// aligned on its own, so the slot alignment does not depend on the layout of any
@@ -729,12 +783,14 @@ mod task {
     /// It fits in 64 bytes, ensuring multiple threads can initialize tasks at the same time
     /// without causing false sharing.
     pub struct Task {
-        // 48 bytes; 64-aligned because it is the first field of a 64-aligned struct.
+        // 40 bytes; 64-aligned because it is the first field of a 64-aligned struct.
         data: [u8; INLINE_TASK_MAX_SIZE],
         // 8 bytes (usize/u64 ptr)
         data_large_ptr: AtomicPtr<u8>,
         // 8 bytes (usize/u64 ptr)
         fn_ptr: fn(&mut Task),
+        // 8 bytes (usize/u64 ptr)
+        drop_ptr: fn(&mut Task),
     }
 
     const _: () = {
@@ -753,6 +809,7 @@ mod task {
                 data: [0u8; INLINE_TASK_MAX_SIZE],
                 data_large_ptr: AtomicPtr::new(large_data_ptr),
                 fn_ptr: |_| {},
+                drop_ptr: |_| {},
             }
         }
 
@@ -773,9 +830,13 @@ mod task {
                 self.fn_ptr = |task| {
                     // SAFETY: Paired with the ptr::write to data above.
                     let f = unsafe { std::ptr::read(task.data.as_mut_ptr() as *mut F) };
-                    if let Err(payload) = catch_unwind(AssertUnwindSafe(f)) {
-                        log::warn!("{:?}", CallError::from_panic(payload));
+                    if let Err(err) = catch_unwind(AssertUnwindSafe(f)) {
+                        log::warn!("{:?}", CallError::from_panic(err));
                     }
+                };
+                self.drop_ptr = |task| {
+                    // SAFETY: Paired with the ptr::write to data above.
+                    unsafe { std::ptr::drop_in_place(task.data.as_mut_ptr() as *mut F) };
                 };
             } else if fits_arena {
                 // SAFETY: size + align checked above, read back exactly once by fn_ptr.
@@ -787,9 +848,17 @@ mod task {
                     let f = unsafe {
                         std::ptr::read(task.data_large_ptr.load(Ordering::Relaxed) as *mut F)
                     };
-                    if let Err(payload) = catch_unwind(AssertUnwindSafe(f)) {
-                        log::warn!("{:?}", CallError::from_panic(payload));
+                    if let Err(err) = catch_unwind(AssertUnwindSafe(f)) {
+                        log::warn!("{:?}", CallError::from_panic(err));
                     }
+                };
+                self.drop_ptr = |task| {
+                    // SAFETY: Paired with the ptr::write to data_large_ptr above.
+                    unsafe {
+                        std::ptr::drop_in_place(
+                            task.data_large_ptr.load(Ordering::Relaxed) as *mut F
+                        )
+                    };
                 };
             } else {
                 // Size or alignment exceeds both slots. Heap-allocate to get a
@@ -803,10 +872,23 @@ mod task {
         /// Runs the task.
         ///
         /// The task must be initialized and run only once per initialization.
-        /// Tasks must run, otherwise we will create memory leaks since we don't
-        /// drop tasks that aren't executed.
         pub fn run(&mut self) {
-            (self.fn_ptr)(self)
+            let fn_ptr = core::mem::replace(&mut self.fn_ptr, |_| {});
+            self.drop_ptr = |_| {};
+            fn_ptr(self)
+        }
+
+        /// Drops an initialized task without running it.
+        fn discard(&mut self) {
+            let drop_ptr = core::mem::replace(&mut self.drop_ptr, |_| {});
+            self.fn_ptr = |_| {};
+            drop_ptr(self)
+        }
+    }
+
+    impl Drop for Task {
+        fn drop(&mut self) {
+            self.discard();
         }
     }
 }
@@ -843,41 +925,25 @@ mod normal_channel {
             &self.runner_id
         }
         /// Creates a new channel and spawns a server thread to process it.
-        pub fn new<I, S>(
-            runner_id: RunnerId,
-            init: I,
-            shutdown: S,
-        ) -> (Self, std::thread::JoinHandle<()>)
-        where
-            I: FnOnce() + Send + 'static,
-            S: FnOnce() + Send + 'static,
-        {
+        pub fn new<I: FnOnce() + Send + 'static>(runner_id: RunnerId, init: I) -> Self {
             let (sender, recv) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send + 'static>>(
                 CHANNEL_MAX_TASK,
             );
 
-            let thread = std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 init();
-                // `Err` means every sender is gone and the queue is drained:
-                // no task can ever arrive again.
-                while let Ok(item) = recv.recv() {
-                    item()
+                loop {
+                    if let Ok(item) = recv.recv() {
+                        item()
+                    }
                 }
-                shutdown();
             });
 
-            (
-                Self {
-                    state: sender,
-                    runner_id,
-                },
-                thread,
-            )
+            Self {
+                state: sender,
+                runner_id,
+            }
         }
-
-        /// Nothing to do: the server stops once every client is dropped and
-        /// the queue is drained.
-        pub fn request_shutdown(&self) {}
 
         /// Atomically reserves a slot in the buffer and writes the task.
         pub fn enqueue<F: FnOnce() + Send + 'static>(&self, func: F) -> Result<(), CallError> {
@@ -897,18 +963,23 @@ mod normal_channel {
 /// no allocation (most of the time, see [`task`] for more details.
 mod custom_channel {
     use crate::device::handle::{
-        CallError,
+        CallError, DeviceGenerationId, DeviceLeaseRelease,
         channel::{
-            RunnerId,
+            CLOSED_GENERATIONS, CREATED_GENERATIONS, RunnerId, is_device_runner_thread,
             task::{ArenaSlot, GLOBAL_TASK_MAX_SIZE, Task},
         },
     };
     use core::{
         hint::spin_loop,
-        sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+        sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
         time::Duration,
     };
-    use std::{sync::Arc, vec::Vec};
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        sync::{Arc, Condvar, Mutex, Weak},
+        thread::JoinHandle,
+        vec::Vec,
+    };
 
     /// Maximum number of [`Task`] that can be queued.
     pub const CHANNEL_MAX_TASK: usize = 32;
@@ -938,66 +1009,545 @@ mod custom_channel {
     /// to avoid stalling the producer's critical path.
     const SLEEP_STEP_CLIENT: Duration = Duration::from_micros(75);
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum GenerationStatus {
+        Starting,
+        Running,
+        Closing,
+        Closed,
+    }
+
+    enum BeginClose {
+        Started,
+        Shared,
+        AlreadyClosing,
+    }
+
+    pub(super) enum GenerationUpgrade {
+        Ready(DeviceClient),
+        Closing(GenerationWaiter),
+        Gone,
+    }
+
+    pub(super) struct GenerationWaiter {
+        generation: Arc<RuntimeGeneration>,
+    }
+
+    impl GenerationWaiter {
+        pub(super) fn wait_closed(self) {
+            assert!(
+                !is_device_runner_thread(&self.generation.runner_id),
+                "a device runner cannot wait for its own generation to close"
+            );
+            if self.generation.join_runner().is_err() {
+                log::warn!(
+                    "Device runner {:?} panicked before replacement",
+                    self.generation.runner_id
+                );
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct GenerationCloser {
+        generation: Arc<RuntimeGeneration>,
+    }
+
+    impl GenerationCloser {
+        pub(super) fn generation_id(&self) -> DeviceGenerationId {
+            self.generation.id
+        }
+
+        pub(super) fn shutdown(&self) -> Result<(), ()> {
+            RuntimeGeneration::close_forced(&self.generation).map(|_| ())
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct WeakDeviceClient {
+        generation: Weak<RuntimeGeneration>,
+    }
+
+    impl WeakDeviceClient {
+        pub(super) fn upgrade(&self) -> GenerationUpgrade {
+            let Some(generation) = self.generation.upgrade() else {
+                return GenerationUpgrade::Gone;
+            };
+            RuntimeGeneration::upgrade(generation)
+        }
+
+        pub(super) fn closer(&self) -> Option<GenerationCloser> {
+            self.generation
+                .upgrade()
+                .map(|generation| GenerationCloser { generation })
+        }
+    }
+
+    struct GenerationLifecycle {
+        status: GenerationStatus,
+        runner_panicked: bool,
+    }
+
+    struct RuntimeGeneration {
+        id: DeviceGenerationId,
+        runner_id: RunnerId,
+        state: Arc<State>,
+        external_count: AtomicUsize,
+        internal_count: AtomicUsize,
+        lifecycle: Mutex<GenerationLifecycle>,
+        closed: Condvar,
+        join_handle: Mutex<Option<JoinHandle<()>>>,
+        join_delegated: AtomicBool,
+        runner_close_fallback: AtomicBool,
+        #[cfg(test)]
+        fail_delegate_join_spawn: AtomicBool,
+    }
+
+    impl RuntimeGeneration {
+        fn new(runner_id: RunnerId, state: Arc<State>) -> Arc<Self> {
+            static NEXT_GENERATION_ID: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(1);
+
+            let generation = Arc::new(Self {
+                id: DeviceGenerationId::new(NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed)),
+                runner_id,
+                state,
+                external_count: AtomicUsize::new(0),
+                internal_count: AtomicUsize::new(0),
+                lifecycle: Mutex::new(GenerationLifecycle {
+                    status: GenerationStatus::Starting,
+                    runner_panicked: false,
+                }),
+                closed: Condvar::new(),
+                join_handle: Mutex::new(None),
+                join_delegated: AtomicBool::new(false),
+                runner_close_fallback: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_delegate_join_spawn: AtomicBool::new(false),
+            });
+            CREATED_GENERATIONS.fetch_add(1, Ordering::Relaxed);
+            generation
+        }
+
+        fn external_lease_unchecked(self: &Arc<Self>) -> ExternalLease {
+            self.external_count.fetch_add(1, Ordering::Relaxed);
+            ExternalLease {
+                generation: Some(Arc::clone(self)),
+            }
+        }
+
+        fn upgrade(generation: Arc<Self>) -> GenerationUpgrade {
+            let lifecycle = generation.lifecycle.lock().unwrap();
+            match lifecycle.status {
+                GenerationStatus::Starting | GenerationStatus::Running => {
+                    generation.external_count.fetch_add(1, Ordering::Relaxed);
+                    drop(lifecycle);
+                    let state = Arc::clone(&generation.state);
+                    GenerationUpgrade::Ready(DeviceClient {
+                        state,
+                        lease: ExternalLease {
+                            generation: Some(generation),
+                        },
+                    })
+                }
+                GenerationStatus::Closing => {
+                    drop(lifecycle);
+                    GenerationUpgrade::Closing(GenerationWaiter { generation })
+                }
+                GenerationStatus::Closed => GenerationUpgrade::Gone,
+            }
+        }
+
+        fn internal_reference(self: &Arc<Self>) -> InternalReference {
+            self.internal_count.fetch_add(1, Ordering::Relaxed);
+            InternalReference {
+                generation: Arc::clone(self),
+            }
+        }
+
+        fn set_join_handle(&self, join_handle: JoinHandle<()>) {
+            *self.join_handle.lock().unwrap() = Some(join_handle);
+        }
+
+        fn mark_running(&self) {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            if lifecycle.status == GenerationStatus::Starting {
+                lifecycle.status = GenerationStatus::Running;
+            }
+        }
+
+        fn mark_closed(&self, panicked: bool) {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            lifecycle.runner_panicked |= panicked;
+            if lifecycle.status != GenerationStatus::Closed {
+                lifecycle.status = GenerationStatus::Closed;
+                CLOSED_GENERATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            self.closed.notify_all();
+        }
+
+        fn begin_close(&self, only_if_unowned: bool) -> BeginClose {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            match lifecycle.status {
+                GenerationStatus::Starting | GenerationStatus::Running => {
+                    if only_if_unowned && self.external_count.load(Ordering::Acquire) != 0 {
+                        return BeginClose::Shared;
+                    }
+                    lifecycle.status = GenerationStatus::Closing;
+                    drop(lifecycle);
+                    self.state.accepting.swap(false, Ordering::SeqCst);
+                    self.state.close_requested.store(true, Ordering::Release);
+                    BeginClose::Started
+                }
+                GenerationStatus::Closing | GenerationStatus::Closed => BeginClose::AlreadyClosing,
+            }
+        }
+
+        fn finish_close(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
+            if is_device_runner_thread(&generation.runner_id) {
+                Self::delegate_join(generation);
+                return Ok(DeviceLeaseRelease::Closing);
+            }
+
+            generation
+                .join_runner()
+                .map(|()| DeviceLeaseRelease::Closed)
+        }
+
+        fn close_if_unowned(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
+            match generation.begin_close(true) {
+                BeginClose::Shared => Ok(DeviceLeaseRelease::Shared),
+                BeginClose::Started | BeginClose::AlreadyClosing => Self::finish_close(generation),
+            }
+        }
+
+        fn close_forced(generation: &Arc<Self>) -> Result<DeviceLeaseRelease, ()> {
+            match generation.begin_close(false) {
+                BeginClose::Started | BeginClose::AlreadyClosing => Self::finish_close(generation),
+                BeginClose::Shared => unreachable!("forced close ignores external owners"),
+            }
+        }
+
+        fn close(generation: &Arc<Self>) -> Result<(), ()> {
+            Self::close_forced(generation).map(|_| ())
+        }
+
+        fn delegate_join(generation: &Arc<Self>) {
+            if generation.join_handle.lock().unwrap().is_none() {
+                return;
+            }
+            if generation
+                .join_delegated
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+
+            let runner_id = generation.runner_id;
+
+            #[cfg(test)]
+            if generation
+                .fail_delegate_join_spawn
+                .swap(false, Ordering::AcqRel)
+            {
+                generation
+                    .runner_close_fallback
+                    .store(true, Ordering::Release);
+                generation.join_delegated.store(false, Ordering::Release);
+                return;
+            }
+
+            let join_generation = Arc::clone(generation);
+            let result = std::thread::Builder::new()
+                .name(std::format!(
+                    "DS-J-{}-{}",
+                    runner_id.device.type_id,
+                    runner_id.device.index_id
+                ))
+                .spawn(move || {
+                    if join_generation.join_runner().is_err() {
+                        log::warn!(
+                            "Device runner {:?} panicked during delegated shutdown",
+                            join_generation.runner_id
+                        );
+                    }
+                });
+
+            if let Err(err) = result {
+                generation
+                    .runner_close_fallback
+                    .store(true, Ordering::Release);
+                generation.join_delegated.store(false, Ordering::Release);
+                // The runner still owns an internal reference and will quiesce itself. Keep the
+                // join handle available in case another off-runner closer arrives. Otherwise the
+                // runner marks itself closed after service shutdown.
+                log::warn!(
+                    "Failed to spawn joiner for device runner {:?}: {err}",
+                    runner_id
+                );
+            }
+        }
+
+        fn join_runner(&self) -> Result<(), ()> {
+            let join_handle = self.join_handle.lock().unwrap().take();
+            if let Some(join_handle) = join_handle {
+                self.runner_close_fallback.store(false, Ordering::Release);
+                let panicked = join_handle.join().is_err();
+                self.mark_closed(panicked);
+            } else {
+                let mut lifecycle = self.lifecycle.lock().unwrap();
+                while lifecycle.status != GenerationStatus::Closed {
+                    lifecycle = self.closed.wait(lifecycle).unwrap();
+                }
+            }
+
+            let lifecycle = self.lifecycle.lock().unwrap();
+            if lifecycle.runner_panicked {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        #[cfg(test)]
+        fn status(&self) -> GenerationStatus {
+            self.lifecycle.lock().unwrap().status
+        }
+
+        #[cfg(test)]
+        fn fail_next_delegate_join_spawn(&self) {
+            self.fail_delegate_join_spawn.store(true, Ordering::Release);
+        }
+    }
+
+    pub(in crate::device::handle) struct ExternalLease {
+        generation: Option<Arc<RuntimeGeneration>>,
+    }
+
+    impl ExternalLease {
+        fn generation(&self) -> &Arc<RuntimeGeneration> {
+            self.generation.as_ref().unwrap()
+        }
+
+        pub(in crate::device::handle) fn generation_id(&self) -> DeviceGenerationId {
+            self.generation().id
+        }
+
+        pub(in crate::device::handle) fn release(
+            mut self,
+        ) -> Result<
+            crate::device::handle::DeviceLeaseRelease,
+            crate::device::handle::DeviceLeaseReleaseError,
+        > {
+            self.release_inner()
+        }
+
+        fn release_inner(
+            &mut self,
+        ) -> Result<
+            crate::device::handle::DeviceLeaseRelease,
+            crate::device::handle::DeviceLeaseReleaseError,
+        > {
+            use crate::device::handle::{DeviceLeaseRelease, DeviceLeaseReleaseError};
+
+            let Some(generation) = self.generation.take() else {
+                return Ok(DeviceLeaseRelease::Stateless);
+            };
+            if generation.external_count.fetch_sub(1, Ordering::AcqRel) != 1 {
+                return Ok(DeviceLeaseRelease::Shared);
+            }
+
+            match RuntimeGeneration::close_if_unowned(&generation) {
+                Ok(outcome) => Ok(outcome),
+                Err(()) => Err(DeviceLeaseReleaseError::closed_with_runner_panic(
+                    generation.id,
+                )),
+            }
+        }
+    }
+
+    impl Clone for ExternalLease {
+        fn clone(&self) -> Self {
+            let generation = self.generation.as_ref().unwrap();
+            generation.external_count.fetch_add(1, Ordering::Relaxed);
+            Self {
+                generation: Some(Arc::clone(generation)),
+            }
+        }
+    }
+
+    impl Drop for ExternalLease {
+        fn drop(&mut self) {
+            if let Err(err) = self.release_inner() {
+                log::warn!("Device lease shutdown failed: {err}");
+            }
+        }
+    }
+
+    struct InternalReference {
+        generation: Arc<RuntimeGeneration>,
+    }
+
+    impl Drop for InternalReference {
+        fn drop(&mut self) {
+            self.generation
+                .internal_count
+                .fetch_sub(1, Ordering::Release);
+        }
+    }
+
     /// The client-side handle used to enqueue tasks.
     pub struct DeviceClient {
         state: Arc<State>,
+        lease: ExternalLease,
     }
 
     impl Clone for DeviceClient {
         fn clone(&self) -> Self {
             Self {
                 state: self.state.clone(),
+                lease: self.lease.clone(),
             }
         }
     }
 
     impl DeviceClient {
+        pub(super) fn downgrade(&self) -> WeakDeviceClient {
+            WeakDeviceClient {
+                generation: Arc::downgrade(self.lease.generation()),
+            }
+        }
+
+        pub(super) fn try_clone_generation(&self) -> GenerationUpgrade {
+            RuntimeGeneration::upgrade(Arc::clone(self.lease.generation()))
+        }
+
+        pub(super) fn closer(&self) -> GenerationCloser {
+            GenerationCloser {
+                generation: Arc::clone(self.lease.generation()),
+            }
+        }
+
+        pub(super) fn is_active(&self) -> bool {
+            matches!(
+                self.lease.generation().lifecycle.lock().unwrap().status,
+                GenerationStatus::Starting | GenerationStatus::Running
+            )
+        }
+
         /// Gets the runner id associated to the channel.
         pub fn runner_id(&self) -> &RunnerId {
-            &self.state.runner_id
+            &self.lease.generation().runner_id
         }
+
+        pub fn generation_id(&self) -> DeviceGenerationId {
+            self.lease.generation().id
+        }
+
+        pub fn external_lease(&self) -> ExternalLease {
+            self.lease.clone()
+        }
+
+        #[cfg(test)]
+        pub fn external_count(&self) -> usize {
+            self.lease
+                .generation()
+                .external_count
+                .load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        pub fn internal_count(&self) -> usize {
+            self.lease
+                .generation()
+                .internal_count
+                .load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        pub fn generation_status(&self) -> GenerationStatus {
+            self.lease.generation().status()
+        }
+
+        #[cfg(test)]
+        pub fn fail_next_delegate_join_spawn(&self) {
+            self.lease.generation().fail_next_delegate_join_spawn();
+        }
+
         /// Creates a new channel and spawns a server thread to process it.
-        pub fn new<I, S>(
-            runner_id: RunnerId,
-            init: I,
-            shutdown: S,
-        ) -> (Self, std::thread::JoinHandle<()>)
+        pub fn new<I, S>(runner_id: RunnerId, init: I, shutdown: S) -> Self
         where
             I: FnOnce() + Send + 'static,
             S: FnOnce() + Send + 'static,
         {
             let mut server = Server::new(runner_id);
             let state = server.state.clone();
+            let generation = RuntimeGeneration::new(runner_id, Arc::clone(&state));
+            let lease = generation.external_lease_unchecked();
+            let runner_reference = generation.internal_reference();
+            let runner_generation = Arc::clone(&generation);
 
-            let thread = std::thread::Builder::new()
+            let join_handle = std::thread::Builder::new()
                 .name(std::format!(
-                    "DS{}-{}-{}",
+                    "DS{}-{}-{}-g{}",
                     match runner_id.stage {
                         crate::device::DeviceServiceStage::Upstream => "U",
                         crate::device::DeviceServiceStage::Downstream => "D",
                     },
                     runner_id.device.type_id,
-                    runner_id.device.index_id
+                    runner_id.device.index_id,
+                    generation.id.0
                 ))
                 .spawn(move || {
-                    init();
-                    server.start();
-                    shutdown();
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        init();
+                        runner_generation.mark_running();
+                        server.start();
+                        shutdown();
+                    }));
+                    core::mem::drop(runner_reference);
+
+                    if runner_generation
+                        .runner_close_fallback
+                        .load(Ordering::Acquire)
+                    {
+                        runner_generation.mark_closed(result.is_err());
+                    }
+
+                    if let Err(err) = result {
+                        resume_unwind(err);
+                    }
                 })
                 .unwrap();
 
-            (Self { state }, thread)
-        }
+            generation.set_join_handle(join_handle);
 
-        /// Signals the server to run any remaining tasks and stop once every
-        /// client is dropped. Queued tasks may themselves hold clients, so the
-        /// server keeps draining until the last one is gone.
-        pub fn request_shutdown(&self) {
-            self.state.shutdown.store(true, Ordering::Release);
+            Self { state, lease }
         }
 
         /// Atomically reserves a slot in the buffer and writes the task.
         pub fn enqueue<F: FnOnce() + Send + 'static>(&self, func: F) -> Result<(), CallError> {
+            if !self.state.accepting.load(Ordering::SeqCst) {
+                return Err(CallError::disconnected());
+            }
+            self.state.active_enqueues.fetch_add(1, Ordering::SeqCst);
+            if !self.state.accepting.load(Ordering::SeqCst) {
+                self.state.active_enqueues.fetch_sub(1, Ordering::SeqCst);
+                return Err(CallError::disconnected());
+            }
+
+            let reference = self.lease.generation().internal_reference();
+            self.enqueue_unchecked(move || {
+                let _reference = reference;
+                func();
+            });
+            self.state.active_enqueues.fetch_sub(1, Ordering::SeqCst);
+
+            Ok(())
+        }
+
+        fn enqueue_unchecked<F: FnOnce() + Send + 'static>(&self, func: F) {
             let mut idle_count: u32 = 0;
             loop {
                 let index = self.state.available_index.fetch_add(1, Ordering::Acquire) as usize;
@@ -1016,13 +1566,34 @@ mod custom_channel {
 
                 self.state.init_task_at(index, func);
                 self.state.enqueued_count.fetch_add(1, Ordering::SeqCst);
-                return Ok(());
+                return;
             }
         }
 
         /// Forces a flush by filling the remaining buffer with no-op tasks.
         pub fn flush(&self) {
-            self.state.pad_with_noops();
+            if !self.state.accepting.load(Ordering::SeqCst) {
+                return;
+            }
+            self.state.active_enqueues.fetch_add(1, Ordering::SeqCst);
+            if !self.state.accepting.load(Ordering::SeqCst) {
+                self.state.active_enqueues.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+
+            self.state.publish_partial_buffer();
+            self.state.active_enqueues.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        /// Stops accepting work, drains queued tasks, and joins the runner.
+        pub fn shutdown(&self) -> Result<(), ()> {
+            RuntimeGeneration::close(self.lease.generation())
+        }
+
+        #[cfg(test)]
+        /// Returns whether the runner still accepts task submissions.
+        pub fn is_accepting(&self) -> bool {
+            self.state.accepting.load(Ordering::Acquire)
         }
     }
 
@@ -1036,49 +1607,15 @@ mod custom_channel {
         available_index: AtomicU32,
         /// Number of tasks successfully written and ready for processing.
         enqueued_count: AtomicU32,
-        /// Set by [`DeviceClient::request_shutdown`]; the server winds down
-        /// once it is set and every client is dropped.
-        shutdown: AtomicBool,
-        /// The runner id (for debugging purposes).
-        runner_id: RunnerId,
+        /// Whether clients may enqueue new work.
+        accepting: AtomicBool,
+        /// Number of clients currently writing queue slots.
+        active_enqueues: AtomicU32,
+        /// Whether the server should stop after draining every accepted task.
+        close_requested: AtomicBool,
     }
 
     impl State {
-        /// Fills the rest of the current queue with no-op tasks so a partially
-        /// filled buffer reaches [`CHANNEL_MAX_TASK`] and the server swaps it in.
-        ///
-        /// Both sides of the protocol go through here, [`DeviceClient::flush`] and
-        /// [`Server::try_shutdown`], so the two copies cannot drift apart.
-        ///
-        /// `inline` keeps the client side, which is on the submit path, exactly as it was
-        /// when the body was spelled out in [`DeviceClient::flush`].
-        #[inline]
-        fn pad_with_noops(&self) {
-            let index_start =
-                self.available_index
-                    .fetch_add(CHANNEL_MAX_TASK as u32, Ordering::Acquire) as usize;
-
-            // The queue is already flushed.
-            if index_start >= CHANNEL_MAX_TASK {
-                return;
-            }
-
-            // We clamp the number of no-op to the required amount.
-            //
-            // # Notes
-            //
-            // index_end != index_start + CHANNEL_MAX_TASK;
-            let index_end = CHANNEL_MAX_TASK;
-
-            for index in index_start..index_end {
-                self.init_task_at(index, || ());
-            }
-
-            let actual_added = index_end - index_start;
-            self.enqueued_count
-                .fetch_add(actual_added as u32, Ordering::SeqCst);
-        }
-
         /// Initializes the task at `index` in the current queue with `func`.
         /// Exclusive access per slot is guaranteed by `available_index.fetch_add`.
         fn init_task_at<F: FnOnce() + Send + 'static>(&self, index: usize, func: F) {
@@ -1086,6 +1623,23 @@ mod custom_channel {
             // SAFETY: queue_ptr points to a valid buffer of CHANNEL_MAX_TASK tasks,
             // bounds checked above, and the &mut doesn't escape.
             unsafe { &mut *self.queue_ptr.load(Ordering::Acquire).add(index) }.init(func);
+        }
+
+        fn publish_partial_buffer(&self) {
+            let index_start =
+                self.available_index
+                    .fetch_add(CHANNEL_MAX_TASK as u32, Ordering::Acquire) as usize;
+
+            if index_start >= CHANNEL_MAX_TASK {
+                return;
+            }
+
+            for index in index_start..CHANNEL_MAX_TASK {
+                self.init_task_at(index, || ());
+            }
+
+            self.enqueued_count
+                .fetch_add((CHANNEL_MAX_TASK - index_start) as u32, Ordering::SeqCst);
         }
     }
 
@@ -1124,15 +1678,16 @@ mod custom_channel {
     }
 
     impl Server {
-        fn new(runner_id: RunnerId) -> Self {
+        fn new(_runner_id: RunnerId) -> Self {
             let mut buffers = [TaskBuffer::new(), TaskBuffer::new()];
 
             let state = Arc::new(State {
                 queue_ptr: AtomicPtr::new(buffers[0].tasks.as_mut_ptr()),
                 available_index: AtomicU32::new(0),
                 enqueued_count: AtomicU32::new(0),
-                shutdown: AtomicBool::new(false),
-                runner_id,
+                accepting: AtomicBool::new(true),
+                active_enqueues: AtomicU32::new(0),
+                close_requested: AtomicBool::new(false),
             });
 
             Self {
@@ -1160,62 +1715,27 @@ mod custom_channel {
                     continue;
                 }
 
-                if idle_count < SPIN_BUDGET_SERVER {
-                    spin_loop();
-                } else {
-                    // Past the hot window, so this costs nothing on the fast
-                    // path. A strong count of one means this server owns the
-                    // only reference to the state: every client is gone and no
-                    // new task can arrive.
-                    if (self.state.shutdown.load(Ordering::Acquire)
-                        || Arc::strong_count(&self.state) == 1)
-                        && self.try_shutdown()
-                    {
+                if self.state.close_requested.load(Ordering::Acquire)
+                    && self.state.active_enqueues.load(Ordering::SeqCst) == 0
+                {
+                    let queue_size = self.state.enqueued_count.load(Ordering::SeqCst) as usize;
+                    if queue_size == 0 {
                         return;
                     }
-                    if idle_count < SPIN_BUDGET_SERVER + YIELD_BUDGET_SERVER {
-                        std::thread::yield_now();
-                    } else {
-                        std::thread::sleep(SLEEP_STEP_SERVER);
-                    }
+
+                    self.state.publish_partial_buffer();
+                    continue;
+                }
+
+                if idle_count < SPIN_BUDGET_SERVER {
+                    spin_loop();
+                } else if idle_count < SPIN_BUDGET_SERVER + YIELD_BUDGET_SERVER {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(SLEEP_STEP_SERVER);
                 }
                 idle_count = idle_count.saturating_add(1);
             }
-        }
-
-        /// Winds the server down once no more work can arrive.
-        ///
-        /// Returns `true` when this server holds the last reference to its state
-        /// and the queue is empty, meaning the thread can stop. Otherwise pads the
-        /// buffer with no-ops exactly like a client flush so the main loop executes
-        /// what is queued, and returns `false`. Queued tasks may hold client clones,
-        /// which is why draining must happen before the strong count can reach one.
-        ///
-        /// # Notes
-        ///
-        /// The strong count is read *before* `enqueued_count`, and that order is
-        /// load-bearing. Once the count is one there is no producer left and none can
-        /// appear, which is what makes the queue read that follows authoritative.
-        /// Reading the queue first would let the last client enqueue a task and drop
-        /// its handle in between the two loads: the server would see a stale empty
-        /// queue next to a fresh count of one and exit with a written-but-never-run
-        /// task, leaking it and everything it captured (see [`Task::run`]).
-        fn try_shutdown(&mut self) -> bool {
-            let is_last_ref = Arc::strong_count(&self.state) == 1;
-
-            if is_last_ref {
-                // `Arc::strong_count` is a relaxed load. This fence pairs with the
-                // release on the last client's `Arc` drop, so every task those
-                // clients wrote is visible to the `enqueued_count` load below.
-                core::sync::atomic::fence(Ordering::Acquire);
-            }
-
-            if self.state.enqueued_count.load(Ordering::Acquire) > 0 {
-                self.state.pad_with_noops();
-                return false;
-            }
-
-            is_last_ref
         }
 
         fn execute_tasks(&mut self) {
@@ -1251,16 +1771,15 @@ mod custom_channel {
 
 #[cfg(test)]
 mod tests {
-    use crate::device::handle::DeviceFixture;
-    use crate::device::handle::{CallResultExt, DeviceHandle};
-    // Only the `cfg(not(miri))` flushing test uses this.
-    #[cfg(not(miri))]
     use crate::device::handle::channel::custom_channel::CHANNEL_MAX_TASK;
+    use crate::device::handle::{CallResultExt, DeviceLeaseRelease};
+    use crate::device_handle::DeviceHandle;
 
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     // A mock service to track state changes and initialization
     struct MockService {
@@ -1278,18 +1797,778 @@ mod tests {
         }
     }
 
-    /// A [`MockService`] handle on a device of its own, whose runner is shut down when
-    /// the returned value drops.
-    fn mock_fixture() -> DeviceFixture<DeviceHandle<MockService, ChannelDeviceHandle>> {
-        DeviceFixture::new(
-            DeviceHandle::<MockService, ChannelDeviceHandle>::new,
-            shutdown_device_for_fixture,
+    #[test]
+    fn test_shutdown_waits_for_active_task_and_runs_service_shutdown() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 100,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (task_started_tx, task_started_rx) = mpsc::channel();
+        let (task_release_tx, task_release_rx) = mpsc::channel();
+        let (service_shutdown_tx, service_shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || service_shutdown_tx.send(()).unwrap(),
+        );
+
+        client
+            .enqueue(move || {
+                task_started_tx.send(()).unwrap();
+                task_release_rx.recv().unwrap();
+            })
+            .unwrap();
+        client.flush();
+        task_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
+
+        let (runner_shutdown_tx, runner_shutdown_rx) = mpsc::channel();
+        let shutdown_client = client.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_client.shutdown().unwrap();
+            runner_shutdown_tx.send(()).unwrap();
+        });
+
+        assert!(
+            runner_shutdown_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "shutdown must wait for the active task"
+        );
+
+        task_release_tx.send(()).unwrap();
+        runner_shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runner should finish after the active task");
+        service_shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("service shutdown should run before the runner exits");
+        shutdown_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_shutdown_drains_buffered_tasks_and_drops_captures() {
+        struct DropSpy(Arc<AtomicUsize>);
+
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 101,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (task_started_tx, task_started_rx) = mpsc::channel();
+        let (task_release_tx, task_release_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+
+        client
+            .enqueue(move || {
+                task_started_tx.send(()).unwrap();
+                task_release_rx.recv().unwrap();
+            })
+            .unwrap();
+        client.flush();
+        task_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
+
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let spy = DropSpy(Arc::clone(&drop_count));
+        let run_count_task = Arc::clone(&run_count);
+        client
+            .enqueue(move || {
+                let _ = &spy;
+                run_count_task.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+
+        let shutdown_client = client.clone();
+        let shutdown_thread = std::thread::spawn(move || shutdown_client.shutdown().unwrap());
+        while client.is_accepting() {
+            std::thread::yield_now();
+        }
+        task_release_tx.send(()).unwrap();
+        shutdown_thread.join().unwrap();
+
+        assert_eq!(run_count.load(Ordering::SeqCst), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_final_external_drop_off_runner_closes_generation() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 102,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            move || SERVER_THREAD.with_borrow_mut(|state| *state = Some(runner_id)),
+            move || shutdown_tx.send(()).unwrap(),
+        );
+
+        drop(client);
+
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("final external drop should join the runner");
+    }
+
+    #[test]
+    fn test_explicit_final_lease_release_closes_generation() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 109,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || shutdown_tx.send(()).unwrap(),
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        client.enqueue(move || ready_tx.send(()).unwrap()).unwrap();
+        client.flush();
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let lease = client.external_lease();
+        drop(client);
+
+        assert_eq!(lease.release().unwrap(), DeviceLeaseRelease::Closed);
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("final explicit release should join the runner");
+    }
+
+    #[test]
+    fn test_explicit_shared_lease_release_leaves_generation_running() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 110,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || shutdown_tx.send(()).unwrap(),
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        client.enqueue(move || ready_tx.send(()).unwrap()).unwrap();
+        client.flush();
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let lease = client.external_lease();
+
+        assert_eq!(lease.release().unwrap(), DeviceLeaseRelease::Shared);
+        assert_eq!(
+            client.generation_status(),
+            custom_channel::GenerationStatus::Running
+        );
+        assert!(shutdown_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        drop(client);
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the remaining owner should close the runner");
+    }
+
+    #[test]
+    fn test_explicit_final_release_reports_closed_runner_panic() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 111,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let client = custom_channel::DeviceClient::new(runner_id, || {}, || panic!("shutdown"));
+        let generation_id = client.generation_id();
+        let lease = client.external_lease();
+        drop(client);
+
+        let error = lease.release().unwrap_err();
+        assert_eq!(error.generation_id(), generation_id);
+    }
+
+    #[test]
+    fn test_explicit_final_release_on_runner_reports_closing() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 112,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            move || SERVER_THREAD.with_borrow_mut(|state| *state = Some(runner_id)),
+            move || shutdown_tx.send(()).unwrap(),
+        );
+        let lease = client.external_lease();
+        client
+            .enqueue(move || outcome_tx.send(lease.release().unwrap()).unwrap())
+            .unwrap();
+        client.flush();
+        drop(client);
+
+        assert_eq!(
+            outcome_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DeviceLeaseRelease::Closing
+        );
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("delegated join should complete after the runner task returns");
+    }
+
+    #[test]
+    fn test_registered_final_drop_closes_and_recreates_generation() {
+        struct LifecycleService {
+            shutdown_tx: Option<mpsc::Sender<()>>,
+        }
+
+        impl DeviceService for LifecycleService {
+            fn init(_id: DeviceId) -> Self {
+                unreachable!()
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                self.shutdown_tx.take().unwrap().send(()).unwrap();
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 113,
+        };
+        let (first_tx, first_rx) = mpsc::channel();
+        let first = DeviceHandle::<LifecycleService, ChannelDeviceHandle>::insert(
+            device_id,
+            LifecycleService {
+                shutdown_tx: Some(first_tx),
+            },
         )
+        .unwrap();
+        let first_generation = first.handle.state.client.generation_id();
+        drop(first);
+        first_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("weak registries must not pin the first generation");
+
+        let (second_tx, second_rx) = mpsc::channel();
+        let second = DeviceHandle::<LifecycleService, ChannelDeviceHandle>::insert(
+            device_id,
+            LifecycleService {
+                shutdown_tx: Some(second_tx),
+            },
+        )
+        .unwrap();
+        assert_ne!(first_generation, second.handle.state.client.generation_id());
+        drop(second);
+        second_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement generation should also close on final drop");
+    }
+
+    #[test]
+    fn test_generation_metrics_track_create_and_close() {
+        const CHILD_ENV: &str = "CUBECL_GENERATION_METRICS_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("test_generation_metrics_track_create_and_close")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "generation-metrics child process failed");
+            return;
+        }
+
+        let before = crate::device::handle::device_generation_metrics();
+        for index_id in [118, 119] {
+            let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(DeviceId {
+                type_id: 0,
+                index_id,
+            });
+            drop(handle);
+        }
+        let delta = crate::device::handle::device_generation_metrics().delta(before);
+
+        assert_eq!(2, delta.created_generations());
+        assert_eq!(2, delta.closed_generations());
+        assert_eq!(0, delta.active_generations());
+    }
+
+    #[test]
+    fn test_lease_reattaches_service_without_reinitializing() {
+        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        struct ReattachService;
+
+        impl DeviceService for ReattachService {
+            fn init(_id: DeviceId) -> Self {
+                INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+        }
+
+        INIT_CALLS.store(0, Ordering::SeqCst);
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 114,
+        };
+        let first = DeviceHandle::<ReattachService, ChannelDeviceHandle>::new(device_id);
+        let generation = first.handle.state.client.generation_id();
+        let lease = first.lease();
+        drop(first);
+
+        let second = DeviceHandle::<ReattachService, ChannelDeviceHandle>::new(device_id);
+        assert_eq!(generation, second.handle.state.client.generation_id());
+        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+
+        drop(lease);
+        drop(second);
+    }
+
+    #[test]
+    fn test_closing_generation_waiters_share_one_replacement() {
+        use std::sync::{Mutex as StdMutex, OnceLock};
+
+        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static SHUTDOWN_STARTED: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+        static RELEASE_SHUTDOWN: OnceLock<StdMutex<mpsc::Receiver<()>>> = OnceLock::new();
+
+        struct WaitingService {
+            block_shutdown: bool,
+        }
+
+        impl DeviceService for WaitingService {
+            fn init(_id: DeviceId) -> Self {
+                INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+                Self {
+                    block_shutdown: false,
+                }
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                if self.block_shutdown {
+                    SHUTDOWN_STARTED.get().unwrap().send(()).unwrap();
+                    RELEASE_SHUTDOWN
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .recv()
+                        .unwrap();
+                }
+            }
+        }
+
+        INIT_CALLS.store(0, Ordering::SeqCst);
+        let (started_tx, started_rx) = mpsc::channel();
+        SHUTDOWN_STARTED.set(started_tx).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        RELEASE_SHUTDOWN.set(StdMutex::new(release_rx)).unwrap();
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 115,
+        };
+        let old = DeviceHandle::<WaitingService, ChannelDeviceHandle>::insert(
+            device_id,
+            WaitingService {
+                block_shutdown: true,
+            },
+        )
+        .unwrap();
+        let shutdown_client = old.handle.state.client.clone();
+        let shutdown_thread = std::thread::spawn(move || shutdown_client.shutdown().unwrap());
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let first_waiter = std::thread::spawn(move || {
+            DeviceHandle::<WaitingService, ChannelDeviceHandle>::new(device_id)
+        });
+        let second_waiter = std::thread::spawn(move || {
+            DeviceHandle::<WaitingService, ChannelDeviceHandle>::new(device_id)
+        });
+        release_tx.send(()).unwrap();
+        shutdown_thread.join().unwrap();
+
+        let first = first_waiter.join().unwrap();
+        let second = second_waiter.join().unwrap();
+        assert_eq!(
+            first.handle.state.client.generation_id(),
+            second.handle.state.client.generation_id()
+        );
+        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+
+        drop((old, first, second));
+    }
+
+    #[test]
+    fn test_concurrent_final_drop_and_reacquire_returns_usable_generation() {
+        use std::sync::Barrier;
+
+        const ITERATIONS: u16 = 100;
+        for iteration in 0..ITERATIONS {
+            let device_id = DeviceId {
+                type_id: 0,
+                index_id: 400 + iteration,
+            };
+            let old = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
+            let barrier = Arc::new(Barrier::new(2));
+            let drop_barrier = Arc::clone(&barrier);
+            let drop_thread = std::thread::spawn(move || {
+                drop_barrier.wait();
+                drop(old);
+            });
+            let acquire_thread = std::thread::spawn(move || {
+                barrier.wait();
+                DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id)
+            });
+
+            drop_thread.join().unwrap();
+            let current = acquire_thread.join().unwrap();
+            assert_eq!(
+                current.submit_blocking(|service| service.id).unwrap(),
+                device_id
+            );
+            drop(current);
+        }
+    }
+
+    #[test]
+    fn test_stale_channel_is_not_reused_after_forced_shutdown() {
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 117,
+        };
+        let stale = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
+        let stale_generation = stale.handle.state.client.generation_id();
+        stale.handle.state.client.shutdown().unwrap();
+
+        let replacement = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
+        assert_ne!(
+            stale_generation,
+            replacement.handle.state.client.generation_id()
+        );
+        assert_eq!(
+            replacement.submit_blocking(|service| service.id).unwrap(),
+            device_id
+        );
+
+        drop((stale, replacement));
+    }
+
+    #[test]
+    fn test_strong_registry_rollback_switch() {
+        const CHILD_ENV: &str = "CUBECL_STRONG_REGISTRY_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("test_strong_registry_rollback_switch")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .env("CUBECL_STRONG_DEVICE_REGISTRIES", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "strong-registry child process failed");
+            return;
+        }
+
+        struct RollbackService {
+            shutdown_tx: Option<mpsc::Sender<()>>,
+        }
+
+        impl DeviceService for RollbackService {
+            fn init(_id: DeviceId) -> Self {
+                unreachable!()
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                self.shutdown_tx.take().unwrap().send(()).unwrap();
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 116,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let first = DeviceHandle::<RollbackService, ChannelDeviceHandle>::insert(
+            device_id,
+            RollbackService {
+                shutdown_tx: Some(shutdown_tx),
+            },
+        )
+        .unwrap();
+        let generation = first.handle.state.client.generation_id();
+        drop(first);
+
+        assert!(
+            shutdown_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "strong registry rollback must pin the generation"
+        );
+        let second = DeviceHandle::<RollbackService, ChannelDeviceHandle>::new(device_id);
+        assert_eq!(generation, second.handle.state.client.generation_id());
+        drop(second);
+
+        shutdown_device_services().unwrap();
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("explicit shutdown should release strong registry pins");
+    }
+
+    #[test]
+    fn test_final_external_drop_on_runner_delegates_join() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 103,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (task_started_tx, task_started_rx) = mpsc::channel();
+        let (task_release_tx, task_release_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || shutdown_tx.send(()).unwrap(),
+        );
+        let task_client = client.clone();
+
+        client
+            .enqueue(move || {
+                task_started_tx.send(()).unwrap();
+                task_release_rx.recv().unwrap();
+                drop(task_client);
+            })
+            .unwrap();
+        client.flush();
+        task_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
+
+        drop(client);
+        task_release_tx.send(()).unwrap();
+
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runner should tear down after the triggering task returns");
+    }
+
+    #[test]
+    fn test_generation_reference_counts_are_independent() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 104,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let (task_started_tx, task_started_rx) = mpsc::channel();
+        let (task_release_tx, task_release_rx) = mpsc::channel();
+        let client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+
+        assert_eq!(client.external_count(), 1);
+        assert_eq!(client.internal_count(), 1);
+
+        let clone = client.clone();
+        assert_eq!(client.external_count(), 2);
+        drop(clone);
+        assert_eq!(client.external_count(), 1);
+
+        client
+            .enqueue(move || {
+                task_started_tx.send(()).unwrap();
+                task_release_rx.recv().unwrap();
+            })
+            .unwrap();
+        client.flush();
+        task_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
+        assert_eq!(client.internal_count(), 2);
+
+        task_release_tx.send(()).unwrap();
+        client.shutdown().unwrap();
+        assert_eq!(client.internal_count(), 0);
+        assert_eq!(
+            client.generation_status(),
+            custom_channel::GenerationStatus::Closed
+        );
+    }
+
+    #[test]
+    fn test_concurrent_close_is_idempotent() {
+        use std::sync::Barrier;
+
+        const CLOSERS: usize = 4;
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 105,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let shutdown_count = Arc::new(AtomicUsize::new(0));
+        let shutdown_count_runner = Arc::clone(&shutdown_count);
+        let client = custom_channel::DeviceClient::new(
+            runner_id,
+            || {},
+            move || {
+                shutdown_count_runner.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let barrier = Arc::new(Barrier::new(CLOSERS));
+        let mut closers = Vec::new();
+
+        for _ in 0..CLOSERS {
+            let client = client.clone();
+            let barrier = Arc::clone(&barrier);
+            closers.push(std::thread::spawn(move || {
+                barrier.wait();
+                client.shutdown().unwrap();
+            }));
+        }
+        for closer in closers {
+            closer.join().unwrap();
+        }
+
+        assert_eq!(shutdown_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.generation_status(),
+            custom_channel::GenerationStatus::Closed
+        );
+    }
+
+    #[test]
+    fn test_close_drains_tasks_accepted_concurrently() {
+        use std::sync::Barrier;
+
+        const PRODUCERS: usize = 4;
+        const ITERATIONS: u16 = 100;
+
+        for iteration in 0..ITERATIONS {
+            let runner_id = RunnerId {
+                device: DeviceId {
+                    type_id: 0,
+                    index_id: 200 + iteration,
+                },
+                stage: DeviceServiceStage::Downstream,
+            };
+            let client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+            let barrier = Arc::new(Barrier::new(PRODUCERS + 1));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let executed = Arc::new(AtomicUsize::new(0));
+            let mut producers = Vec::new();
+
+            for _ in 0..PRODUCERS {
+                let client = client.clone();
+                let barrier = Arc::clone(&barrier);
+                let accepted = Arc::clone(&accepted);
+                let executed = Arc::clone(&executed);
+                producers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    if client
+                        .enqueue(move || {
+                            executed.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .is_ok()
+                    {
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            }
+
+            barrier.wait();
+            client.shutdown().unwrap();
+            for producer in producers {
+                producer.join().unwrap();
+            }
+
+            assert_eq!(
+                accepted.load(Ordering::SeqCst),
+                executed.load(Ordering::SeqCst),
+                "Iteration {iteration} lost an accepted task"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stale_generation_close_does_not_close_replacement() {
+        let runner_id = RunnerId {
+            device: DeviceId {
+                type_id: 0,
+                index_id: 106,
+            },
+            stage: DeviceServiceStage::Downstream,
+        };
+        let old_client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+        let stale_client = old_client.clone();
+        let old_generation = old_client.generation_id();
+        old_client.shutdown().unwrap();
+
+        let new_client = custom_channel::DeviceClient::new(runner_id, || {}, || {});
+        let new_generation = new_client.generation_id();
+        assert_ne!(old_generation, new_generation);
+
+        stale_client.shutdown().unwrap();
+        let (task_tx, task_rx) = mpsc::channel();
+        new_client
+            .enqueue(move || task_tx.send(()).unwrap())
+            .unwrap();
+        new_client.flush();
+        task_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stale close must not affect the replacement generation");
+        new_client.shutdown().unwrap();
     }
 
     #[test]
     fn test_basic_execution_and_state_persistence() {
-        let handle = mock_fixture();
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 1,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
 
         // Task 1: Increment the counter
         let res = handle
@@ -1312,8 +2591,344 @@ mod tests {
     }
 
     #[test]
+    fn test_services_share_generation_by_runner_id() {
+        struct OtherService;
+        struct UpstreamService;
+
+        impl DeviceService for OtherService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+        }
+
+        impl DeviceService for UpstreamService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn stage() -> DeviceServiceStage {
+                DeviceServiceStage::Upstream
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 107,
+        };
+        let first = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
+        let second = DeviceHandle::<OtherService, ChannelDeviceHandle>::new(device_id);
+        let upstream = DeviceHandle::<UpstreamService, ChannelDeviceHandle>::new(device_id);
+
+        assert_eq!(
+            first.handle.state.client.generation_id(),
+            second.handle.state.client.generation_id()
+        );
+        assert_ne!(
+            first.handle.state.client.generation_id(),
+            upstream.handle.state.client.generation_id()
+        );
+
+        let external_count = first.handle.state.client.external_count();
+        let lease = first.lease();
+        assert_eq!(
+            lease.generation_id(),
+            Some(first.handle.state.client.generation_id())
+        );
+        assert_eq!(
+            first.handle.state.client.external_count(),
+            external_count + 1
+        );
+        drop(lease);
+        assert_eq!(first.handle.state.client.external_count(), external_count);
+    }
+
+    #[test]
+    fn test_staged_shutdown_allows_upstream_to_initialize_downstream() {
+        const CHILD_ENV: &str = "CUBECL_STAGED_SHUTDOWN_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("test_staged_shutdown_allows_upstream_to_initialize_downstream")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "staged shutdown child process failed");
+            return;
+        }
+
+        use std::sync::{Mutex as StdMutex, OnceLock};
+
+        static EVENTS: OnceLock<mpsc::Sender<&'static str>> = OnceLock::new();
+        static RELEASE_UPSTREAM: OnceLock<StdMutex<mpsc::Receiver<()>>> = OnceLock::new();
+
+        struct DownstreamService;
+        struct ExternalService;
+        struct OtherUpstreamService;
+        struct UpstreamService;
+
+        impl DeviceService for DownstreamService {
+            fn init(_id: DeviceId) -> Self {
+                EVENTS.get().unwrap().send("downstream_init").unwrap();
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                let rejected = catch_unwind(AssertUnwindSafe(|| {
+                    DeviceHandle::<OtherUpstreamService, ChannelDeviceHandle>::new(DeviceId {
+                        type_id: 9,
+                        index_id: 4,
+                    })
+                }));
+                assert!(rejected.is_err());
+                EVENTS
+                    .get()
+                    .unwrap()
+                    .send("downstream_to_upstream_rejected")
+                    .unwrap();
+                EVENTS.get().unwrap().send("downstream_shutdown").unwrap();
+            }
+        }
+
+        impl DeviceService for ExternalService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+        }
+
+        impl DeviceService for OtherUpstreamService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn stage() -> DeviceServiceStage {
+                DeviceServiceStage::Upstream
+            }
+        }
+
+        impl DeviceService for UpstreamService {
+            fn init(_id: DeviceId) -> Self {
+                Self
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                EVENTS.get().unwrap().send("upstream_start").unwrap();
+                RELEASE_UPSTREAM
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .unwrap();
+
+                let downstream =
+                    DeviceHandle::<DownstreamService, ChannelDeviceHandle>::new(DeviceId {
+                        type_id: 9,
+                        index_id: 2,
+                    });
+                downstream
+                    .submit_blocking(|_| {
+                        EVENTS.get().unwrap().send("downstream_use").unwrap();
+                    })
+                    .unwrap();
+                assert_eq!(
+                    downstream.handle.state.client.generation_status(),
+                    custom_channel::GenerationStatus::Running
+                );
+                drop(downstream);
+
+                let rejected = catch_unwind(AssertUnwindSafe(|| {
+                    DeviceHandle::<OtherUpstreamService, ChannelDeviceHandle>::new(DeviceId {
+                        type_id: 9,
+                        index_id: 3,
+                    })
+                }));
+                assert!(rejected.is_err());
+                EVENTS.get().unwrap().send("same_stage_rejected").unwrap();
+                EVENTS.get().unwrap().send("upstream_done").unwrap();
+            }
+
+            fn stage() -> DeviceServiceStage {
+                DeviceServiceStage::Upstream
+            }
+        }
+
+        let (events_tx, events_rx) = mpsc::channel();
+        EVENTS.set(events_tx).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        RELEASE_UPSTREAM.set(StdMutex::new(release_rx)).unwrap();
+
+        let upstream = DeviceHandle::<UpstreamService, ChannelDeviceHandle>::new(DeviceId {
+            type_id: 9,
+            index_id: 1,
+        });
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::channel();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_device_services().unwrap();
+            shutdown_done_tx.send(()).unwrap();
+        });
+
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "upstream_start"
+        );
+
+        let (external_done_tx, external_done_rx) = mpsc::channel();
+        let external_thread = std::thread::spawn(move || {
+            let handle = DeviceHandle::<ExternalService, ChannelDeviceHandle>::new(DeviceId {
+                type_id: 9,
+                index_id: 5,
+            });
+            external_done_tx.send(()).unwrap();
+            handle
+        });
+        assert!(
+            external_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "external initialization must remain parked during shutdown"
+        );
+
+        release_tx.send(()).unwrap();
+        let events = (0..6)
+            .map(|_| events_rx.recv_timeout(Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+        let position = |event| events.iter().position(|item| *item == event).unwrap();
+        assert!(position("downstream_init") < position("downstream_use"));
+        assert!(position("same_stage_rejected") < position("upstream_done"));
+        assert!(position("downstream_to_upstream_rejected") < position("downstream_shutdown"));
+
+        shutdown_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown must not count the parked external initializer");
+        shutdown_thread.join().unwrap();
+        external_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("external initialization should resume after shutdown");
+        let external = external_thread.join().unwrap();
+
+        drop((upstream, external));
+        shutdown_device_services().unwrap();
+    }
+
+    #[test]
+    fn test_on_runner_close_releases_service_borrow_before_shutdown() {
+        struct ShutdownService {
+            shutdown_tx: Option<mpsc::Sender<()>>,
+        }
+
+        impl DeviceService for ShutdownService {
+            fn init(_id: DeviceId) -> Self {
+                unreachable!()
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                self.shutdown_tx.take().unwrap().send(()).unwrap();
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 108,
+        };
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let handle = DeviceHandle::<ShutdownService, ChannelDeviceHandle>::insert(
+            device_id,
+            ShutdownService {
+                shutdown_tx: Some(shutdown_tx),
+            },
+        )
+        .unwrap();
+        let shutdown_client = handle.handle.state.client.clone();
+
+        handle.submit(move |_| shutdown_client.shutdown().unwrap());
+        handle.flush_queue();
+
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("service shutdown should run after the task releases its borrow");
+    }
+
+    #[test]
+    fn test_delegate_join_spawn_failure_closes_generation_and_allows_replacement() {
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 111,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
+        let generation_id = handle.handle.state.client.generation_id();
+        handle.handle.state.client.fail_next_delegate_join_spawn();
+        let shutdown_client = handle.handle.state.client.clone();
+
+        handle.submit(move |_| shutdown_client.shutdown().unwrap());
+        handle.flush_queue();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while handle.handle.state.client.generation_status()
+            != custom_channel::GenerationStatus::Closed
+        {
+            assert!(
+                Instant::now() < deadline,
+                "runner should mark the generation closed when delegated join cannot start"
+            );
+            std::thread::yield_now();
+        }
+
+        let (replacement_tx, replacement_rx) = mpsc::channel();
+        let replacement_thread = std::thread::spawn(move || {
+            replacement_tx
+                .send(DeviceHandle::<MockService, ChannelDeviceHandle>::new(
+                    device_id,
+                ))
+                .unwrap();
+        });
+        let replacement = replacement_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement generation should not wait for a missing joiner");
+        replacement_thread.join().unwrap();
+        assert_ne!(
+            generation_id,
+            replacement.handle.state.client.generation_id()
+        );
+
+        drop((handle, replacement));
+    }
+
+    #[test]
     fn test_scoped_tasks_and_lifetimes() {
-        let handle = mock_fixture();
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 3,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
 
         let local_val = 42; // This lives on the test stack
 
@@ -1336,7 +2951,12 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn test_buffer_flushing_at_limit() {
-        let handle = mock_fixture();
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 4,
+        };
+
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
         let completed_count = Arc::new(AtomicUsize::new(0));
 
         // We fill exactly CHANNEL_MAX_TASK
@@ -1356,7 +2976,11 @@ mod tests {
 
     #[test]
     fn test_manual_flush_for_partial_buffer() {
-        let handle = mock_fixture();
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 5,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
         let (tx, rx) = oneshot::channel();
 
         // Send only 1 task (buffer is not full)
@@ -1365,7 +2989,7 @@ mod tests {
         });
 
         // This would hang forever if flush() didn't fill the buffer with no-ops
-        handle.handle.handle.state.client.flush();
+        handle.handle.state.client.flush();
 
         let received = rx
             .recv_timeout(Duration::from_secs(1))
@@ -1373,50 +2997,14 @@ mod tests {
         assert!(received);
     }
 
-    /// A task the last client enqueued without flushing still runs before the runner
-    /// exits. Nothing but the shutdown drain can execute it: the buffer is partial, so
-    /// the main loop never swaps it in on its own.
     #[test]
-    fn test_shutdown_drains_a_task_the_last_client_left_queued() {
-        let ran = Arc::new(AtomicUsize::new(0));
-
-        {
-            let handle = mock_fixture();
-            let counter = Arc::clone(&ran);
-            handle.submit(move |_state| {
-                counter.fetch_add(1, Ordering::SeqCst);
-            });
-            // The handle drops first, then the fixture's guard shuts the runner down.
-        }
-
-        assert_eq!(
-            ran.load(Ordering::SeqCst),
-            1,
-            "the queued task must run before the runner thread exits"
-        );
-    }
-
-    /// A handle created for a device that was shut down gets a fresh runner with fresh
-    /// state, rather than hanging on the old one or reviving it.
-    #[test]
-    fn test_handle_created_after_shutdown_gets_a_fresh_runner() {
-        let device_id = {
-            let handle = mock_fixture();
-            handle.submit_blocking(|state| state.counter += 1).unwrap();
-            handle.device_id()
+    fn test_closure_captures_are_dropped_after_execution() {
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 6,
         };
 
         let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
-        let counter = handle.submit_blocking(|state| state.counter).unwrap();
-        assert_eq!(counter, 0, "the new runner must start from a fresh service");
-
-        drop(handle);
-        shutdown_device(device_id);
-    }
-
-    #[test]
-    fn test_closure_captures_are_dropped_after_execution() {
-        let handle = mock_fixture();
 
         // This atomic counter will track how many times our "Spy" is dropped.
         let drop_count = Arc::new(AtomicUsize::new(0));
@@ -1453,10 +3041,14 @@ mod tests {
 
     #[test]
     fn test_large_closure_uses_arena() {
-        // Closure captures > 48 bytes (InlineSlot), forcing the arena path.
-        let handle = mock_fixture();
+        // Closure captures > 40 bytes (InlineSlot), forcing the arena path.
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 7,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
 
-        let big_data = [42u8; 128]; // 128 bytes > 48 byte inline limit
+        let big_data = [42u8; 128]; // 128 bytes > 40 byte inline limit
         let result = handle
             .submit_blocking(move |_state| {
                 // Use big_data to prevent it from being optimized away.
@@ -1470,7 +3062,11 @@ mod tests {
     #[test]
     fn test_extra_large_closure_uses_box() {
         // Closure captures > 4096 bytes (GLOBAL_TASK_MAX_SIZE), forcing the Box fallback.
-        let handle = mock_fixture();
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 8,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
 
         let huge_data = [7u8; 8192]; // 8KB > 4096 byte arena limit
         let result = handle
@@ -1483,12 +3079,16 @@ mod tests {
     #[test]
     fn test_large_closure_drop_is_called() {
         // Verify that Drop runs correctly for closures stored in the arena.
-        let handle = mock_fixture();
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 9,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
         let drop_count = Arc::new(AtomicUsize::new(0));
 
         struct DropSpy {
             counter: Arc<AtomicUsize>,
-            _padding: [u8; 128], // Force arena path (> 48 bytes)
+            _padding: [u8; 128], // Force arena path (> 40 bytes)
         }
         impl Drop for DropSpy {
             fn drop(&mut self) {
@@ -1535,13 +3135,11 @@ mod tests {
         INIT_CALLS.store(0, Ordering::SeqCst);
 
         const THREADS: usize = 4;
-        // The fixture's own handle is one of the racing callers, so it is created after
-        // `INIT_CALLS` is reset and counts towards the single expected init.
-        let fixture = DeviceFixture::new(
-            DeviceHandle::<CountingService, ChannelDeviceHandle>::new,
-            shutdown_device_for_fixture,
-        );
-        let device_id = fixture.device_id();
+        // Unique device_id so the global `CHANNELS` entry is independent of other tests.
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 77,
+        };
 
         let barrier = Arc::new(Barrier::new(THREADS));
         let mut handles = Vec::new();
@@ -1552,14 +3150,26 @@ mod tests {
                 DeviceHandle::<CountingService, ChannelDeviceHandle>::new(device_id)
             }));
         }
-        for h in handles {
-            let _ = h.join().unwrap();
-        }
+        // Keep every returned handle alive through the assertions. Dropping each handle while
+        // extracting its ID can release the final external lease before a racing initializer has
+        // acquired its lease, allowing a legitimate replacement generation.
+        let joined = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let generation_ids = joined
+            .iter()
+            .map(|handle| handle.handle.state.client.generation_id())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             INIT_CALLS.load(Ordering::SeqCst),
             1,
             "CountingService::init must run exactly once across {THREADS} racing callers"
+        );
+        assert!(
+            generation_ids.windows(2).all(|ids| ids[0] == ids[1]),
+            "Concurrent initialization must reuse one generation"
         );
     }
 
@@ -1567,7 +3177,11 @@ mod tests {
     /// task's captures exactly once, and leave the channel usable.
     #[test]
     fn test_submit_blocking_panic_drops_and_returns_err() {
-        let handle = mock_fixture();
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 10,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
         let drop_count = Arc::new(AtomicUsize::new(0));
 
         struct DropSpy(Arc<AtomicUsize>);
@@ -1583,12 +3197,7 @@ mod tests {
             panic!("boom");
         });
 
-        let err = result.expect_err("panicking task must return Err");
-        assert_eq!(
-            err.message(),
-            Some("boom"),
-            "the panic message must be preserved in the CallError"
-        );
+        assert!(result.is_err(), "panicking task must return Err");
         assert_eq!(
             drop_count.load(Ordering::SeqCst),
             1,
@@ -1603,7 +3212,11 @@ mod tests {
     /// Same guarantees for `exclusive`.
     #[test]
     fn test_exclusive_panic_drops_and_returns_err() {
-        let handle = mock_fixture();
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 11,
+        };
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
         let drop_count = Arc::new(AtomicUsize::new(0));
 
         struct DropSpy(Arc<AtomicUsize>);
@@ -1619,265 +3232,10 @@ mod tests {
             panic!("boom");
         });
 
-        let err = result.expect_err("panicking task must return Err");
-        assert_eq!(
-            err.message(),
-            Some("boom"),
-            "the panic message must be preserved in the CallError"
-        );
+        assert!(result.is_err());
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
         let ok = handle.exclusive(|| 7).unwrap();
         assert_eq!(ok, 7);
-    }
-
-    /// A.1 — Submit a panic payload as task, capture the payload and return to caller.
-    #[test]
-    fn test_submit_blocking_preserves_formatted_string_payload() {
-        let handle = mock_fixture();
-
-        let result = handle.submit_blocking(|_state| {
-            panic!("value {}", 99);
-        });
-
-        let err = result.expect_err("panicking task must return Err");
-        assert_eq!(err.message(), Some("value 99"));
-    }
-
-    /// A.2 — Submit a custom panic payload, capture the payload and return to caller.
-    #[test]
-    fn test_submit_blocking_preserves_non_string_payload() {
-        let handle = mock_fixture();
-
-        #[derive(Debug, PartialEq)]
-        struct Boom {
-            code: u32,
-            what: &'static str,
-        }
-
-        let result = handle.submit_blocking(|_state| {
-            std::panic::panic_any(Boom {
-                code: 7,
-                what: "kaboom",
-            });
-        });
-
-        let err = result.expect_err("panicking task must return Err");
-        assert_eq!(err.message(), None, "a non-string payload has no message");
-        let payload = err.into_panic().expect("the payload must be preserved");
-        let boom = *payload
-            .downcast::<Boom>()
-            .expect("payload must downcast to the original type");
-        assert_eq!(
-            boom,
-            Boom {
-                code: 7,
-                what: "kaboom",
-            }
-        );
-    }
-
-    #[test]
-    fn test_submit_blocking_preserves_scalar_payload() {
-        let handle = mock_fixture();
-
-        let result = handle.submit_blocking(|_state| {
-            std::panic::panic_any(42i32);
-        });
-
-        let err = result.expect_err("panicking task must return Err");
-        assert_eq!(err.message(), None);
-        let payload = err.into_panic().expect("the payload must be preserved");
-        assert_eq!(
-            *payload.downcast::<i32>().expect("payload must be an i32"),
-            42
-        );
-    }
-
-    /// B.1 — A real index-out-of-bounds panic (the symptom from the issue) keeps its
-    /// message instead of being erased into a generic error.
-    #[test]
-    fn test_submit_blocking_preserves_index_out_of_bounds_message() {
-        let handle = mock_fixture();
-
-        let result = handle.submit_blocking(|_state| {
-            let data = [10u8, 20u8];
-            // `black_box` hides the index so the access happens at runtime rather than
-            // tripping the const-eval `unconditional_panic` lint.
-            let idx = core::hint::black_box(5usize);
-            let _ = data[idx];
-        });
-
-        let err = result.expect_err("panicking task must return Err");
-        let message = err
-            .message()
-            .expect("an index panic carries a string message");
-        assert!(
-            message.contains("index out of bounds"),
-            "unexpected message: {message}"
-        );
-    }
-
-    /// B.2 — A real `unwrap()` panic keeps its message (the autotune symptom).
-    #[test]
-    fn test_submit_blocking_preserves_unwrap_message() {
-        let handle = mock_fixture();
-
-        let result = handle.submit_blocking(|_state| {
-            let value: Result<(), &str> = Err("nope");
-            #[allow(clippy::unnecessary_literal_unwrap)]
-            value.unwrap();
-        });
-
-        let err = result.expect_err("panicking task must return Err");
-        let message = err
-            .message()
-            .expect("an unwrap panic carries a string message");
-        assert!(message.contains("unwrap"), "unexpected message: {message}");
-    }
-
-    /// C.1 — The captured payload can re-raise the original panic via `resume_unwind`,
-    /// proving it is the genuine payload and not a lossy copy.
-    #[test]
-    fn test_into_panic_can_be_resumed() {
-        let handle = mock_fixture();
-
-        let result = handle.submit_blocking(|_state| {
-            panic!("re-raise me");
-        });
-
-        let err = result.expect_err("panicking task must return Err");
-        assert_eq!(err.message(), Some("re-raise me"));
-
-        let payload = err.into_panic().expect("the payload must be preserved");
-        // Re-raise on this thread and catch it again: the round-tripped payload must
-        // still hold the original message.
-        let recaught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            std::panic::resume_unwind(payload);
-        }));
-        let payload = recaught.expect_err("resume_unwind must re-panic");
-        assert_eq!(
-            payload.downcast_ref::<&str>().copied(),
-            Some("re-raise me"),
-            "the re-raised panic must carry the original message"
-        );
-    }
-
-    /// E.1 — `exclusive` preserves a non-string payload just like `submit_blocking`.
-    #[test]
-    fn test_exclusive_preserves_non_string_payload() {
-        let handle = mock_fixture();
-
-        #[derive(Debug, PartialEq)]
-        struct Boom {
-            code: u32,
-            what: &'static str,
-        }
-
-        let result: Result<(), _> = handle.exclusive(|| {
-            std::panic::panic_any(Boom {
-                code: 9,
-                what: "exclusive",
-            });
-        });
-
-        let err = result.expect_err("panicking task must return Err");
-        assert_eq!(err.message(), None);
-        let payload = err.into_panic().expect("the payload must be preserved");
-        let boom = *payload
-            .downcast::<Boom>()
-            .expect("payload must downcast to the original type");
-        assert_eq!(
-            boom,
-            Boom {
-                code: 9,
-                what: "exclusive",
-            }
-        );
-    }
-
-    /// E.3 — The runner thread survives repeated panics, each call surfaces its own
-    /// payload, and a later normal task still succeeds.
-    #[test]
-    fn test_channel_survives_repeated_panics_each_preserved() {
-        let handle = mock_fixture();
-
-        let first = handle.submit_blocking(|_state| panic!("first"));
-        assert_eq!(
-            first.expect_err("first panic must return Err").message(),
-            Some("first")
-        );
-
-        let second = handle.submit_blocking(|_state| panic!("second"));
-        assert_eq!(
-            second.expect_err("second panic must return Err").message(),
-            Some("second")
-        );
-
-        // The runner thread is still alive: a normal task runs and returns Ok.
-        let counter = handle.submit_blocking(|state| state.counter).unwrap();
-        assert_eq!(counter, 0);
-    }
-
-    /// 2-E1 — `unwrap_or_resume` re-raises a runner-thread panic as the *original*
-    /// panic on the caller (faithful message), and the runner thread survives.
-    #[test]
-    fn test_unwrap_or_resume_reraises_submit_blocking_panic() {
-        let handle = mock_fixture();
-
-        let reraised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle
-                .submit_blocking(|_state| {
-                    panic!("device boom");
-                })
-                .unwrap_or_resume()
-        }));
-
-        let payload = reraised.expect_err("the original panic must be re-raised at the caller");
-        assert_eq!(
-            payload.downcast_ref::<&str>().copied(),
-            Some("device boom"),
-            "the re-raised panic must carry the original message"
-        );
-
-        // The runner thread survived the captured-and-re-raised panic.
-        let counter = handle.submit_blocking(|state| state.counter).unwrap();
-        assert_eq!(counter, 0);
-    }
-
-    /// 2-E2 — `unwrap_or_resume` re-raises a non-string payload from `exclusive`
-    /// end to end, preserving the exact payload object.
-    #[test]
-    fn test_unwrap_or_resume_reraises_exclusive_non_string_payload() {
-        let handle = mock_fixture();
-
-        #[derive(Debug, PartialEq)]
-        struct Boom {
-            code: u32,
-            what: &'static str,
-        }
-
-        let reraised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle
-                .exclusive(|| {
-                    std::panic::panic_any(Boom {
-                        code: 9,
-                        what: "exclusive",
-                    });
-                })
-                .unwrap_or_resume()
-        }));
-
-        let payload = reraised.expect_err("the original panic must be re-raised at the caller");
-        let boom = *payload
-            .downcast::<Boom>()
-            .expect("the re-raised payload must be the original object");
-        assert_eq!(
-            boom,
-            Boom {
-                code: 9,
-                what: "exclusive",
-            }
-        );
     }
 
     /// A closure that spills to the arena (size > 48) and carries the maximum arena
@@ -1931,5 +3289,224 @@ mod tests {
             let _: usize = d.data.iter().map(|&b| b as usize).sum();
         });
         task.run();
+    }
+
+    #[test]
+    fn test_task_drop_discards_closure_captures_without_running() {
+        use super::task::{ArenaSlot, GLOBAL_TASK_MAX_SIZE, Task};
+
+        struct DropSpy<const N: usize> {
+            counter: Arc<AtomicUsize>,
+            _padding: [u8; N],
+        }
+
+        impl<const N: usize> Drop for DropSpy<N> {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn assert_discarded<F: FnOnce() + Send + 'static>(
+            task_fn: F,
+            drop_count: &Arc<AtomicUsize>,
+            run_count: &Arc<AtomicUsize>,
+        ) {
+            let mut arena = alloc::boxed::Box::new(ArenaSlot {
+                data: [0u8; GLOBAL_TASK_MAX_SIZE],
+            });
+            let mut task = Task::new(arena.data.as_mut_ptr());
+            task.init(task_fn);
+            drop(task);
+
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+            assert_eq!(run_count.load(Ordering::SeqCst), 0);
+        }
+
+        fn run_case<const N: usize>() {
+            let drop_count = Arc::new(AtomicUsize::new(0));
+            let run_count = Arc::new(AtomicUsize::new(0));
+            let spy = DropSpy {
+                counter: Arc::clone(&drop_count),
+                _padding: [0; N],
+            };
+            let run_count_task = Arc::clone(&run_count);
+
+            assert_discarded(
+                move || {
+                    let _ = &spy;
+                    run_count_task.fetch_add(1, Ordering::SeqCst);
+                },
+                &drop_count,
+                &run_count,
+            );
+        }
+
+        run_case::<0>();
+        run_case::<128>();
+        run_case::<8192>();
+    }
+
+    // These focused checks are kept alongside the generation tests because a generation close
+    // must not regress the upstream channel's lossless panic transport.
+    fn upstream_mock_handle() -> DeviceHandle<MockService, ChannelDeviceHandle> {
+        static NEXT: AtomicUsize = AtomicUsize::new(10_000);
+        DeviceHandle::new(DeviceId {
+            type_id: 0,
+            index_id: NEXT.fetch_add(1, Ordering::Relaxed) as u16,
+        })
+    }
+
+    #[test]
+    fn test_shutdown_drains_a_task_the_last_client_left_queued() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        {
+            let handle = upstream_mock_handle();
+            let ran = Arc::clone(&ran);
+            handle.submit(move |_| {
+                ran.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_handle_created_after_shutdown_gets_a_fresh_runner() {
+        let handle = upstream_mock_handle();
+        let device_id = handle.device_id();
+        handle.submit_blocking(|state| state.counter += 1).unwrap();
+        drop(handle);
+        DeviceHandle::<MockService, ChannelDeviceHandle>::shutdown(device_id);
+        let handle = DeviceHandle::<MockService, ChannelDeviceHandle>::new(device_id);
+        assert_eq!(handle.submit_blocking(|state| state.counter).unwrap(), 0);
+        drop(handle);
+    }
+
+    #[test]
+    fn test_submit_blocking_preserves_formatted_string_payload() {
+        let handle = upstream_mock_handle();
+        let error = handle
+            .submit_blocking(|_| panic!("value {}", 99))
+            .unwrap_err();
+        assert_eq!(error.message(), Some("value 99"));
+    }
+
+    #[test]
+    fn test_submit_blocking_preserves_non_string_payload() {
+        let handle = upstream_mock_handle();
+        let error = handle
+            .submit_blocking(|_| std::panic::panic_any((7u32, "kaboom")))
+            .unwrap_err();
+        let payload = error.into_panic().unwrap();
+        assert_eq!(*payload.downcast::<(u32, &str)>().unwrap(), (7, "kaboom"));
+    }
+
+    #[test]
+    fn test_submit_blocking_preserves_scalar_payload() {
+        let handle = upstream_mock_handle();
+        let error = handle
+            .submit_blocking(|_| std::panic::panic_any(42i32))
+            .unwrap_err();
+        assert_eq!(*error.into_panic().unwrap().downcast::<i32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_submit_blocking_preserves_index_out_of_bounds_message() {
+        let handle = upstream_mock_handle();
+        let error = handle
+            .submit_blocking(|_| {
+                let data = [10u8, 20u8];
+                let index = core::hint::black_box(5usize);
+                let _ = data[index];
+            })
+            .unwrap_err();
+        assert!(error.message().unwrap().contains("index out of bounds"));
+    }
+
+    #[test]
+    fn test_submit_blocking_preserves_unwrap_message() {
+        let handle = upstream_mock_handle();
+        let error = handle
+            .submit_blocking(|_| {
+                let value: Result<(), &str> = Err("nope");
+                #[allow(clippy::unnecessary_literal_unwrap)]
+                value.unwrap();
+            })
+            .unwrap_err();
+        assert!(error.message().unwrap().contains("unwrap"));
+    }
+
+    #[test]
+    fn test_into_panic_can_be_resumed() {
+        let handle = upstream_mock_handle();
+        let error = handle
+            .submit_blocking(|_| panic!("re-raise me"))
+            .unwrap_err();
+        let payload = error.into_panic().unwrap();
+        let recaught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::panic::resume_unwind(payload)
+        }))
+        .unwrap_err();
+        assert_eq!(
+            recaught.downcast_ref::<&str>().copied(),
+            Some("re-raise me")
+        );
+    }
+
+    #[test]
+    fn test_exclusive_preserves_non_string_payload() {
+        let handle = upstream_mock_handle();
+        let error: Result<(), _> = handle.exclusive(|| std::panic::panic_any(9u16));
+        assert_eq!(
+            *error
+                .unwrap_err()
+                .into_panic()
+                .unwrap()
+                .downcast::<u16>()
+                .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn test_channel_survives_repeated_panics_each_preserved() {
+        let handle = upstream_mock_handle();
+        assert_eq!(
+            handle
+                .submit_blocking(|_| panic!("first"))
+                .unwrap_err()
+                .message(),
+            Some("first")
+        );
+        assert_eq!(
+            handle
+                .submit_blocking(|_| panic!("second"))
+                .unwrap_err()
+                .message(),
+            Some("second")
+        );
+        assert_eq!(handle.submit_blocking(|state| state.counter).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_unwrap_or_resume_reraises_submit_blocking_panic() {
+        let handle = upstream_mock_handle();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle
+                .submit_blocking(|_| panic!("device boom"))
+                .unwrap_or_resume();
+        }))
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>().copied(), Some("device boom"));
+    }
+
+    #[test]
+    fn test_unwrap_or_resume_reraises_exclusive_non_string_payload() {
+        let handle = upstream_mock_handle();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result: Result<(), _> = handle.exclusive(|| std::panic::panic_any(11u8));
+            result.unwrap_or_resume();
+        }))
+        .unwrap_err();
+        assert_eq!(*panic.downcast::<u8>().unwrap(), 11);
     }
 }

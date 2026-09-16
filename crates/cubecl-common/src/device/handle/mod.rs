@@ -5,6 +5,167 @@ pub use base::*;
 use crate::device::{DeviceId, DeviceService, ServerUtilitiesHandle, ServiceId};
 use core::any::Any;
 
+/// Opaque identity for one device-runner generation.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct DeviceGenerationId(u64);
+
+impl DeviceGenerationId {
+    #[cfg(feature = "std")]
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Process-wide device-generation counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceGenerationMetrics {
+    created_generations: u64,
+    closed_generations: u64,
+}
+
+impl DeviceGenerationMetrics {
+    /// Returns the number of generations created.
+    pub fn created_generations(&self) -> u64 {
+        self.created_generations
+    }
+    /// Returns the number of generations closed.
+    pub fn closed_generations(&self) -> u64 {
+        self.closed_generations
+    }
+    /// Returns the number of active generations.
+    pub fn active_generations(&self) -> u64 {
+        self.created_generations
+            .saturating_sub(self.closed_generations)
+    }
+    /// Returns the non-negative delta from an earlier snapshot.
+    pub fn delta(self, earlier: Self) -> Self {
+        Self {
+            created_generations: self
+                .created_generations
+                .saturating_sub(earlier.created_generations),
+            closed_generations: self
+                .closed_generations
+                .saturating_sub(earlier.closed_generations),
+        }
+    }
+}
+
+/// Returns process-wide device-generation counters.
+pub fn device_generation_metrics() -> DeviceGenerationMetrics {
+    #[cfg(all(feature = "std", multi_threading))]
+    let (created_generations, closed_generations) = channel::generation_metrics();
+    #[cfg(not(all(feature = "std", multi_threading)))]
+    let (created_generations, closed_generations) = (0, 0);
+    DeviceGenerationMetrics {
+        created_generations,
+        closed_generations,
+    }
+}
+
+/// Outcome of releasing a device-runner generation lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceLeaseRelease {
+    /// The release closed the generation and joined its runner.
+    Closed,
+    /// The release initiated closing from the runner thread; a delegated join remains active.
+    Closing,
+    /// Other external owners still retain the generation.
+    Shared,
+    /// The lease did not retain a channel-backed generation.
+    Stateless,
+}
+
+/// Error returned when a released lease closes a panicked runner.
+#[derive(Debug)]
+pub struct DeviceLeaseReleaseError {
+    generation_id: DeviceGenerationId,
+}
+
+impl DeviceLeaseReleaseError {
+    #[cfg(feature = "std")]
+    pub(crate) fn closed_with_runner_panic(generation_id: DeviceGenerationId) -> Self {
+        Self { generation_id }
+    }
+    /// Returns the affected generation.
+    pub fn generation_id(&self) -> DeviceGenerationId {
+        self.generation_id
+    }
+}
+
+impl core::fmt::Display for DeviceLeaseReleaseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "device runner generation {:?} panicked during shutdown",
+            self.generation_id
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for DeviceLeaseReleaseError {}
+
+/// Keeps a device-runner generation alive while an escaping value remains usable.
+pub struct DeviceLease {
+    #[cfg(feature = "std")]
+    channel: Option<channel::ExternalLease>,
+}
+
+impl DeviceLease {
+    fn stateless() -> Self {
+        Self {
+            #[cfg(feature = "std")]
+            channel: None,
+        }
+    }
+    #[cfg(feature = "std")]
+    pub(in crate::device::handle) fn channel(lease: channel::ExternalLease) -> Self {
+        Self {
+            channel: Some(lease),
+        }
+    }
+    /// Returns the retained generation, if stateful.
+    pub fn generation_id(&self) -> Option<DeviceGenerationId> {
+        #[cfg(feature = "std")]
+        return self
+            .channel
+            .as_ref()
+            .map(channel::ExternalLease::generation_id);
+        #[cfg(not(feature = "std"))]
+        None
+    }
+    /// Releases the lease, closing its generation when it is the final owner.
+    pub fn release(self) -> Result<DeviceLeaseRelease, DeviceLeaseReleaseError> {
+        #[cfg(feature = "std")]
+        {
+            let mut this = self;
+            if let Some(lease) = this.channel.take() {
+                return lease.release();
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = self;
+        Ok(DeviceLeaseRelease::Stateless)
+    }
+}
+
+impl Clone for DeviceLease {
+    fn clone(&self) -> Self {
+        Self {
+            #[cfg(feature = "std")]
+            channel: self.channel.clone(),
+        }
+    }
+}
+
+impl core::fmt::Debug for DeviceLease {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceLease")
+            .field("generation_id", &self.generation_id())
+            .finish()
+    }
+}
+
 #[cfg(feature = "std")]
 #[allow(dead_code)]
 mod channel;
@@ -100,6 +261,11 @@ impl<S: ?Sized + 'static, I: DeviceHandleSpec> DeviceHandle<S, I> {
 
     pub fn utilities(&self) -> ServerUtilitiesHandle {
         self.handle.utilities()
+    }
+
+    /// Returns a lease retaining the current device-runner generation.
+    pub fn lease(&self) -> DeviceLease {
+        self.handle.lease()
     }
 
     pub fn submit_blocking<'a, R: Send, T: FnOnce(&mut S) -> R + Send + 'a>(

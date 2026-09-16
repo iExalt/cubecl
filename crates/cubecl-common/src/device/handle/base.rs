@@ -172,6 +172,11 @@ pub trait DeviceHandleSpec: Sized + Clone {
     /// Retrieves the server utilities for this thread.
     fn utilities(&self) -> ServerUtilitiesHandle;
 
+    /// Returns a lease retaining the current device-runner generation.
+    fn lease(&self) -> super::DeviceLease {
+        super::DeviceLease::stateless()
+    }
+
     /// Doesn't flush the service state, but flushes any task enqueued in the communication
     /// channel.
     ///
