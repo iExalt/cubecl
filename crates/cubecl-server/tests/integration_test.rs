@@ -6,7 +6,7 @@ use cubecl_common::bytes::Bytes;
 use cubecl_common::device::{Device, DeviceId, ServiceId};
 use cubecl_environment::stream::StreamId;
 use cubecl_ir::{ElemType, UIntKind};
-use cubecl_runtime::lifecycle::RuntimeSession;
+use cubecl_runtime::lifecycle::{RuntimeGuard, RuntimeSession};
 use cubecl_server::client::Client;
 use cubecl_server::server::{CubeCount, Handle, KernelArguments, ServerError};
 use cubecl_server::{local_tuner, tune::LocalTuner};
@@ -150,6 +150,42 @@ fn runtime_session_final_pin_closes_generation() {
     assert_eq!(report.closed_generations(), 1);
     assert_eq!(report.closing_generations(), 0);
     assert_eq!(report.shared_generations(), 0);
+}
+
+#[test_log::test]
+#[serial_test::serial]
+fn graph_final_owner_submits_destroy_before_generation_closes() {
+    let device_id = DeviceId::new(0, 106);
+    let client = Client::load::<DummyServer>(device_id);
+    let generation = client.generation_id().unwrap();
+    client.graph_prepare().unwrap();
+    client.start_capture().unwrap();
+    let graph = client.stop_capture().unwrap();
+    let destroys_before = GRAPH_DESTROYS.load(std::sync::atomic::Ordering::SeqCst);
+
+    drop(client);
+    drop(graph);
+
+    assert_eq!(
+        GRAPH_DESTROYS.load(std::sync::atomic::Ordering::SeqCst),
+        destroys_before + 1
+    );
+    let replacement = Client::load::<DummyServer>(device_id);
+    assert_ne!(replacement.generation_id(), Some(generation));
+}
+
+#[test_log::test]
+#[serial_test::serial]
+fn graph_drop_after_forced_shutdown_does_not_panic() {
+    let guard = RuntimeGuard::acquire().unwrap();
+    let client = Client::load::<DummyServer>(DeviceId::new(0, 107));
+    client.graph_prepare().unwrap();
+    client.start_capture().unwrap();
+    let graph = client.stop_capture().unwrap();
+    drop(client);
+
+    guard.shutdown().unwrap();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(graph))).is_ok());
 }
 
 #[test_log::test]

@@ -28,12 +28,16 @@ use cubecl_server::{
 };
 use cubecl_zspace::{Shape, Strides};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Makes `start_profile` fail while set, the way a real server refuses one
 /// inside a graph capture window. Process-wide, so tests that flip it run
 /// `serial`.
 pub static REFUSE_PROFILES: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Number of graph handles destroyed by the dummy server, for lifecycle tests.
+pub static GRAPH_DESTROYS: AtomicUsize = AtomicUsize::new(0);
 
 /// The dummy server is used to test the cubecl-runtime infrastructure.
 /// It uses simple memory management with a bytes storage on CPU, without asynchronous tasks.
@@ -339,6 +343,33 @@ impl<M: Marker> Server for DummyServer<M> {
 
     fn allocation_mode(&mut self, mode: MemoryAllocationMode, _stream_id: StreamId) {
         self.memory_management.mode(mode)
+    }
+
+    fn graph_prepare(&mut self, _stream_id: StreamId) -> Result<(), ServerError> {
+        Ok(())
+    }
+
+    fn begin_capture(&mut self, _stream_id: StreamId) -> Result<(), ServerError> {
+        Ok(())
+    }
+
+    fn end_capture(
+        &mut self,
+        _stream_id: StreamId,
+    ) -> Result<cubecl_server::id::GraphId, ServerError> {
+        Ok(cubecl_server::id::GraphId::new())
+    }
+
+    fn replay(
+        &mut self,
+        _graph: cubecl_server::id::GraphId,
+        _stream_id: StreamId,
+    ) -> Result<(), ServerError> {
+        Ok(())
+    }
+
+    fn graph_destroy(&mut self, _graph: cubecl_server::id::GraphId, _stream_id: StreamId) {
+        GRAPH_DESTROYS.fetch_add(1, Ordering::SeqCst);
     }
 }
 

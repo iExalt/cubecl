@@ -160,8 +160,12 @@ impl Drop for GraphHandle {
         // only thread allowed to touch it) and only once in-flight replays have
         // completed — `replay` returns at enqueue time, not completion. Ship the
         // release to the actor; the backend syncs the stream before it destroys.
-        self.device
-            .submit(move |server| server.graph_destroy(id, stream_id));
+        if let Err(error) = self
+            .device
+            .try_submit(move |server| server.graph_destroy(id, stream_id))
+        {
+            log::debug!("skipping graph {id:?} destruction after runner shutdown: {error:?}");
+        }
     }
 }
 
