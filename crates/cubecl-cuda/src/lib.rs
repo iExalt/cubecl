@@ -98,6 +98,39 @@ mod tests {
 
     #[test]
     fn test_runtime_guard_shutdown() {
+        const CHILD_ENV: &str = "CUBECL_RUNTIME_GUARD_CHILD";
+        const CHILD_TIMEOUT: Duration = Duration::from_secs(180);
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("tests::test_runtime_guard_shutdown")
+                .arg("--test-threads=1")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if started.elapsed() >= CHILD_TIMEOUT {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("runtime guard child process timed out");
+                }
+                sleep(Duration::from_millis(10));
+            };
+
+            assert!(
+                status.success(),
+                "runtime guard child process failed with {status}"
+            );
+            return;
+        }
+
         let guard = RuntimeGuard::acquire().unwrap();
         {
             let _client =
