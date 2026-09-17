@@ -243,6 +243,7 @@ impl Client {
         self.lease.generation_id()
     }
 
+    #[cfg(feature = "std")]
     pub(crate) fn clone_lease(&self) -> DeviceLease {
         self.lease.clone()
     }
