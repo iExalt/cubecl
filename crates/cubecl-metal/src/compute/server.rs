@@ -723,27 +723,6 @@ impl Server for MetalServer {
     }
 }
 
-#[cfg(test)]
-mod pitched_tests {
-    use super::{read_pitched, write_pitched};
-
-    #[test]
-    fn pitched_round_trip() {
-        // A [2, 3] tensor with a row pitch of 4 (one element of padding per row).
-        let shape = [2usize, 3];
-        let strides = [4usize, 1];
-        let packed = [10u8, 20, 30, 40, 50, 60];
-
-        let mut buffer = vec![0u8; 2 * 4];
-        write_pitched(buffer.as_mut_ptr(), &packed, &shape, &strides, 1);
-        // Rows land at offsets 0 and 4; the padding bytes (3, 7) stay zero.
-        assert_eq!(buffer, [10, 20, 30, 0, 40, 50, 60, 0]);
-
-        let read_back = read_pitched(buffer.as_ptr(), &shape, &strides, 1);
-        assert_eq!(read_back, packed);
-    }
-}
-
 impl ServerStorage for MetalServer {
     type Storage = MetalStorage;
 
@@ -767,5 +746,26 @@ impl ServerStorage for MetalServer {
             .map_err(ServerError::from)?;
 
         Ok(ManagedResource::new(memory, resource))
+    }
+}
+
+#[cfg(test)]
+mod pitched_tests {
+    use super::{read_pitched, write_pitched};
+
+    #[test]
+    fn pitched_round_trip() {
+        // A [2, 3] tensor with a row pitch of 4 (one element of padding per row).
+        let shape = [2usize, 3];
+        let strides = [4usize, 1];
+        let packed = [10u8, 20, 30, 40, 50, 60];
+
+        let mut buffer = vec![0u8; 2 * 4];
+        write_pitched(buffer.as_mut_ptr(), &packed, &shape, &strides, 1);
+        // Rows land at offsets 0 and 4; the padding bytes (3, 7) stay zero.
+        assert_eq!(buffer, [10, 20, 30, 0, 40, 50, 60, 0]);
+
+        let read_back = read_pitched(buffer.as_ptr(), &shape, &strides, 1);
+        assert_eq!(read_back, packed);
     }
 }
