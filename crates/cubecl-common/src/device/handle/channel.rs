@@ -300,10 +300,10 @@ impl ServiceState {
 fn shutdown_service_states(states: &mut HashMap<TypeId, ServiceState>) {
     let mut panic_payload = None;
     for state in states.values_mut() {
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| state.shutdown())) {
-            if panic_payload.is_none() {
-                panic_payload = Some(payload);
-            }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| state.shutdown()))
+            && panic_payload.is_none()
+        {
+            panic_payload = Some(payload);
         }
     }
     states.clear();
