@@ -21,6 +21,8 @@ mod tests_expm1;
 mod tests_launch_errors;
 #[cfg(test)]
 mod tests_multistream;
+#[cfg(test)]
+mod tests_shutdown;
 
 #[cfg(test)]
 mod tests {
