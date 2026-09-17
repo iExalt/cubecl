@@ -128,6 +128,24 @@ impl<C: WgpuCompiler> WriteScoped for WgpuServer<C> {
 }
 
 impl<C: WgpuCompiler> WgpuServer<C> {
+    /// Submits and waits for all work owned by this server.
+    pub(crate) fn shutdown(&mut self) -> Result<(), ServerError> {
+        let stream_ids = self.scheduler.stream_ids().collect::<Vec<_>>();
+        self.scheduler.execute_streams(stream_ids.clone());
+
+        let mut first_error = None;
+        for stream_id in stream_ids {
+            let (stream, failures) = self.scheduler.stream_and_failures(&stream_id);
+            if let Err(error) =
+                cubecl_environment::future::block_on(stream.sync(stream_id, failures))
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Create a new server.
     #[allow(clippy::too_many_arguments)]
     pub fn new(

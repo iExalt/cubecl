@@ -12,6 +12,7 @@ use std::{
     boxed::Box,
     format,
     sync::{Arc, mpsc::SyncSender},
+    thread::JoinHandle,
     vec::Vec,
 };
 
@@ -144,24 +145,45 @@ impl<B: EventStreamBackend> StreamFactory for EventStreamBackendWrapper<B> {
 
 #[derive(Debug)]
 struct GcThread<B: EventStreamBackend> {
-    sender: SyncSender<GcTask<B>>,
+    sender: Option<SyncSender<GcTask<B>>>,
+    join_handle: Option<JoinHandle<()>>,
 }
 
 impl<B: EventStreamBackend> GcThread<B> {
     fn new() -> GcThread<B> {
         let (sender, recv) = std::sync::mpsc::sync_channel::<GcTask<B>>(8);
 
-        cubecl_environment::thread::spawn(move || {
+        let join_handle = cubecl_environment::thread::spawn(move || {
             while let Ok(event) = recv.recv() {
-                B::wait_event_sync(event.event).unwrap();
+                if let Err(error) = B::wait_event_sync(event.event) {
+                    log::warn!("Stream garbage-collection event wait failed: {error}");
+                }
                 core::mem::drop(event.to_drop);
             }
         });
 
-        GcThread { sender }
+        GcThread {
+            sender: Some(sender),
+            join_handle: Some(join_handle),
+        }
     }
     fn register(&self, task: GcTask<B>) {
-        self.sender.send(task).unwrap()
+        self.sender.as_ref().unwrap().send(task).unwrap()
+    }
+
+    fn shutdown(&mut self) {
+        core::mem::drop(self.sender.take());
+        if let Some(join_handle) = self.join_handle.take()
+            && join_handle.join().is_err()
+        {
+            log::warn!("Stream garbage-collection thread failed during shutdown");
+        }
+    }
+}
+
+impl<B: EventStreamBackend> Drop for GcThread<B> {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -216,7 +238,7 @@ impl<'a, B: EventStreamBackend> ResolvedStreams<'a, B> {
 
     /// Enqueue a task to be cleaned.
     pub fn gc(&mut self, gc: GcTask<B>) {
-        self.gc.sender.send(gc).unwrap();
+        self.gc.register(gc);
     }
 }
 
@@ -266,7 +288,7 @@ impl<B: EventStreamBackend> MultiStream<B> {
 
     /// Enqueue a task to be cleaned.
     pub fn gc(&mut self, gc: GcTask<B>) {
-        self.gc.sender.send(gc).unwrap();
+        self.gc.register(gc);
     }
 
     /// The backend stream on `stream_id`'s slot when that slot was ever
@@ -421,6 +443,12 @@ impl<B: EventStreamBackend> MultiStream<B> {
     }
 }
 
+impl<B: EventStreamBackend> Drop for MultiStream<B> {
+    fn drop(&mut self) {
+        self.gc.shutdown();
+    }
+}
+
 impl<B: EventStreamBackend> FailureStore for MultiStream<B> {
     type Factory = EventStreamBackendWrapper<B>;
 
@@ -483,6 +511,8 @@ impl SharedBindingAnalysis {
 mod tests {
     use crate::server::Handle;
     use core::sync::atomic::{AtomicBool, Ordering};
+    use cubecl_environment::backtrace::BackTrace;
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
 
@@ -492,6 +522,46 @@ mod tests {
     }
 
     const MAX_STREAMS: u8 = 4;
+
+    #[test]
+    fn test_gc_thread_shutdown_drains_tasks_and_joins() {
+        struct DropSpy(Arc<AtomicUsize>);
+
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut gc = GcThread::<TestBackend>::new();
+        for _ in 0..4 {
+            gc.register(GcTask::new(DropSpy(Arc::clone(&drop_count)), TestEvent {}));
+        }
+
+        gc.shutdown();
+        gc.shutdown();
+
+        assert_eq!(drop_count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn test_gc_thread_error_still_drops_task() {
+        struct DropSpy(Arc<AtomicUsize>);
+
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut gc = GcThread::<ErrorBackend>::new();
+        gc.register(GcTask::new(DropSpy(Arc::clone(&drop_count)), TestEvent {}));
+        gc.shutdown();
+
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
 
     #[test_log::test]
     fn test_analysis_shared_bindings_1() {
@@ -680,6 +750,8 @@ mod tests {
 
     struct TestBackend;
 
+    struct ErrorBackend;
+
     #[derive(Debug, Default)]
     struct TestStream;
 
@@ -781,6 +853,32 @@ mod tests {
 
         fn wait_event_sync(_event: Self::Event) -> Result<(), ServerError> {
             Ok(())
+        }
+
+        fn handle_cursor(_stream: &Self::Stream, _handle: &BufferBinding) -> u64 {
+            0
+        }
+    }
+
+    impl EventStreamBackend for ErrorBackend {
+        type Stream = TestStream;
+        type Event = TestEvent;
+
+        fn create_stream(&self) -> Self::Stream {
+            TestStream
+        }
+
+        fn flush(_stream: &mut Self::Stream, _failures: &mut ErrorGraph) -> Self::Event {
+            TestEvent {}
+        }
+
+        fn wait_event(_stream: &mut Self::Stream, _event: Self::Event) {}
+
+        fn wait_event_sync(_event: Self::Event) -> Result<(), ServerError> {
+            Err(ServerError::Generic {
+                reason: "test event wait failure".into(),
+                backtrace: BackTrace::capture(),
+            })
         }
 
         fn handle_cursor(_stream: &Self::Stream, _handle: &BufferBinding) -> u64 {

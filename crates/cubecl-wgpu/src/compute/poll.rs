@@ -1,12 +1,40 @@
 #[cfg(not(target_family = "wasm"))]
 mod _impl {
-    use std::thread::JoinHandle;
+    use std::{
+        sync::{Arc, mpsc::Receiver},
+        thread::JoinHandle,
+    };
+
+    fn spawn_poll_thread(
+        thread_check: Arc<()>,
+        cancel_receiver: Receiver<()>,
+        mut poll: impl FnMut() + Send + 'static,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            loop {
+                match cancel_receiver.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+
+                // Keep polling while a caller holds a polling handle. Once all
+                // callers release it, park until either work resumes or shutdown
+                // sends cancellation and unparks this thread.
+                if Arc::strong_count(&thread_check) > 2 {
+                    poll();
+                } else {
+                    std::thread::park();
+                }
+                std::thread::yield_now();
+            }
+        })
+    }
 
     #[derive(Debug)]
     pub struct WgpuPoll {
         active_handle: std::sync::Arc<()>,
         cancel_sender: std::sync::mpsc::Sender<()>,
-        poll_thread: JoinHandle<()>,
+        poll_thread: Option<JoinHandle<()>>,
     }
 
     impl WgpuPoll {
@@ -15,51 +43,113 @@ mod _impl {
             let thread_check = active_handle.clone();
 
             let (cancel_sender, cancel_receiver) = std::sync::mpsc::channel();
-            let poll_thread = std::thread::spawn(move || {
-                loop {
-                    // Check whether the WgpuPoll, this thread, and something else is holding
-                    // a handle.
-                    if std::sync::Arc::strong_count(&thread_check) > 2 {
-                        if let Err(e) = device.poll(wgpu::PollType::Wait {
-                            submission_index: None, // Wait for most recent
-                            timeout: None,
-                        }) {
-                            log::warn!(
-                                "wgpu: requested wait timed out before the submission was completed during sync. ({e})"
-                            )
-                        }
-                    } else {
-                        // Do not cancel thread while someone still needs to poll.
-                        if cancel_receiver.try_recv().is_ok() {
-                            break;
-                        }
-
-                        std::thread::park();
-                    }
-                    std::thread::yield_now();
+            let poll_thread = spawn_poll_thread(thread_check, cancel_receiver, move || {
+                if let Err(e) = device.poll(wgpu::PollType::Wait {
+                    submission_index: None, // Wait for most recent
+                    timeout: None,
+                }) {
+                    log::warn!(
+                        "wgpu: requested wait timed out before the submission was completed during sync. ({e})"
+                    )
                 }
             });
 
             Self {
                 active_handle,
                 cancel_sender,
-                poll_thread,
+                poll_thread: Some(poll_thread),
+            }
+        }
+
+        #[cfg(test)]
+        fn new_for_test() -> Self {
+            let active_handle = Arc::new(());
+            let thread_check = active_handle.clone();
+            let (cancel_sender, cancel_receiver) = std::sync::mpsc::channel();
+            let poll_thread = spawn_poll_thread(thread_check, cancel_receiver, || {});
+
+            Self {
+                active_handle,
+                cancel_sender,
+                poll_thread: Some(poll_thread),
+            }
+        }
+
+        #[cfg(test)]
+        fn new_exited_for_test() -> Self {
+            let active_handle = Arc::new(());
+            let thread_check = active_handle.clone();
+            let (cancel_sender, cancel_receiver) = std::sync::mpsc::channel();
+            drop(cancel_receiver);
+            let (exited_sender, exited_receiver) = std::sync::mpsc::channel();
+            drop(exited_sender);
+            let poll_thread = spawn_poll_thread(thread_check, exited_receiver, || {});
+
+            Self {
+                active_handle,
+                cancel_sender,
+                poll_thread: Some(poll_thread),
             }
         }
         /// Get a handle, as long as it's alive the polling will be active.
         pub fn start_polling(&self) -> std::sync::Arc<()> {
             let handle = self.active_handle.clone();
-            self.poll_thread.thread().unpark();
+            if let Some(poll_thread) = &self.poll_thread {
+                poll_thread.thread().unpark();
+            }
             handle
+        }
+
+        /// Stops and joins the polling thread.
+        pub fn shutdown(&mut self) {
+            let Some(poll_thread) = self.poll_thread.take() else {
+                return;
+            };
+
+            if self.cancel_sender.send(()).is_err() {
+                log::warn!("wgpu polling thread exited before shutdown");
+            }
+            poll_thread.thread().unpark();
+            if poll_thread.join().is_err() {
+                log::warn!("wgpu polling thread panicked during shutdown");
+            }
         }
     }
 
     impl Drop for WgpuPoll {
         fn drop(&mut self) {
-            self.cancel_sender
-                .send(())
-                .expect("Failed to shutdown polling thread.");
-            self.poll_thread.thread().unpark();
+            self.shutdown();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::WgpuPoll;
+        use std::{sync::mpsc, time::Duration};
+
+        #[test]
+        fn test_shutdown_finishes_with_outstanding_polling_handle() {
+            let mut poll = WgpuPoll::new_for_test();
+            let polling_handle = poll.start_polling();
+            let (done_sender, done_receiver) = mpsc::channel();
+            let shutdown_thread = std::thread::spawn(move || {
+                poll.shutdown();
+                done_sender.send(()).unwrap();
+            });
+
+            done_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown should not wait for an outstanding polling handle");
+
+            drop(polling_handle);
+            shutdown_thread.join().unwrap();
+        }
+
+        #[test]
+        fn test_shutdown_handles_already_exited_polling_thread() {
+            let mut poll = WgpuPoll::new_exited_for_test();
+            poll.shutdown();
+            poll.shutdown();
         }
     }
 }

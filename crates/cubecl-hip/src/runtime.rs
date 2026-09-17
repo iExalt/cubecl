@@ -220,6 +220,12 @@ impl DeviceService for HipServer {
     fn utilities(&self) -> ServerUtilitiesHandle {
         cubecl_core::server::Server::utilities(self) as ServerUtilitiesHandle
     }
+
+    fn shutdown(&mut self) {
+        if let Err(status) = HipServer::shutdown(self) {
+            log::warn!("Unable to synchronize HIP during shutdown: status {status}");
+        }
+    }
 }
 
 impl Runtime for HipRuntime {

@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use cubecl_common::profile::ProfileDuration;
 use cubecl_environment::future::channel::{Receiver, Sender};
-use cubecl_environment::future::spawn_detached;
+use cubecl_environment::future::{JoinOnDrop, spawn_joinable_fut};
 
 use super::{ProfileLevel, Profiled};
 
@@ -30,6 +30,7 @@ pub struct ServerLogger {
     log_streaming: StreamingLogLevel,
     log_channel: Option<Sender<LogMessage>>,
     log_memory: MemoryLogLevel,
+    worker: Option<JoinOnDrop>,
 }
 
 impl Default for ServerLogger {
@@ -56,6 +57,7 @@ impl Default for ServerLogger {
                 log_streaming: StreamingLogLevel::Disabled,
                 log_channel: None,
                 log_memory: MemoryLogLevel::Disabled,
+                worker: None,
             };
         }
         let profile_level = match logger.config.profiling.logger.level {
@@ -80,14 +82,12 @@ impl Default for ServerLogger {
 
         let (send, rec) = cubecl_environment::future::channel::unbounded();
 
-        // Spawn the logger as a detached task.
         let async_logger = AsyncLogger {
             message: rec,
             logger,
             profiled: Default::default(),
         };
-        // Spawn the future in the background to logs messages / durations.
-        spawn_detached(async_logger.process());
+        let worker = spawn_joinable_fut(async_logger.process());
 
         Self {
             profile_level,
@@ -96,6 +96,20 @@ impl Default for ServerLogger {
             log_streaming,
             log_memory,
             log_channel: Some(send),
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for ServerLogger {
+    fn drop(&mut self) {
+        // Closing the sender lets the worker finish every queued message before
+        // the join below returns.
+        core::mem::drop(self.log_channel.take());
+        if let Some(mut worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            log::warn!("Server logger worker panicked during shutdown");
         }
     }
 }
@@ -248,5 +262,53 @@ impl AsyncLogger {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "std", not(target_family = "wasm")))]
+mod tests {
+    use super::{LogMessage, ServerLogger};
+    use crate::config::{memory::MemoryLogLevel, streaming::StreamingLogLevel};
+    use crate::logging::ProfileLevel;
+    use alloc::string::ToString;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use cubecl_common::profile::{Instant, ProfileDuration, ProfileTicks};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_server_logger_drop_drains_profile_message() {
+        let resolved = Arc::new(AtomicBool::new(false));
+        let resolved_profile = Arc::clone(&resolved);
+        let profile = ProfileDuration::new_device_time(async move {
+            resolved_profile.store(true, Ordering::Release);
+            let now = Instant::now();
+            ProfileTicks::from_start_end(now, now)
+        });
+        let (sender, receiver) = cubecl_environment::future::channel::unbounded();
+        let async_logger = super::AsyncLogger {
+            message: receiver,
+            logger: crate::config::Logger::new(),
+            profiled: Default::default(),
+        };
+        let worker = cubecl_environment::future::spawn_joinable_fut(async_logger.process());
+        let logger = ServerLogger {
+            profile_level: Some(ProfileLevel::Basic),
+            log_compile_info: false,
+            log_compile_source: false,
+            log_streaming: StreamingLogLevel::Disabled,
+            log_channel: Some(sender),
+            log_memory: MemoryLogLevel::Disabled,
+            worker: Some(worker),
+        };
+
+        logger
+            .log_channel
+            .as_ref()
+            .unwrap()
+            .try_send(LogMessage::Profile("shutdown-profile".to_string(), profile))
+            .unwrap();
+        drop(logger);
+
+        assert!(resolved.load(Ordering::Acquire));
     }
 }
