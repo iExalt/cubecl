@@ -578,14 +578,14 @@ fn shutdown_device_with_timeout(device_id: DeviceId, timeout: Duration) {
         );
     });
 
-    // Reserve the gate immediately so new initializers cannot slip in while the coordinator waits
-    // on an active initializer or a runner. The worker owns the permit and downstream pins until
-    // both stages have drained; the caller only waits up to the requested bound.
-    let permit = ShutdownPermit::reserve();
+    // The coordinator owns the shutdown gate and downstream pins until both stages have drained;
+    // the caller only waits up to the requested bound. A concurrent shutdown that is already in
+    // progress therefore also returns after its bound instead of waiting behind that coordinator.
     let (done_sender, done_receiver) = mpsc::sync_channel(0);
     let spawn_result = std::thread::Builder::new()
         .name(std::format!("cubecl-device-shutdown-{device_id:?}"))
         .spawn(move || {
+            let permit = ShutdownPermit::reserve();
             shutdown_device_staged(device_id, permit);
             let _ = done_sender.send(());
         });
@@ -2037,6 +2037,15 @@ mod tests {
 
         shutdown_device_bounded_for_test(device_id, Duration::from_millis(10));
         assert_eq!(old_client.generation_status(), GenerationStatus::Closing);
+
+        let (second_shutdown_done, second_shutdown_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            shutdown_device_bounded_for_test(device_id, Duration::from_millis(10));
+            second_shutdown_done.send(()).unwrap();
+        });
+        second_shutdown_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a second shutdown must honor its own timeout while the first drains");
 
         let replacement = std::thread::spawn(move || {
             DeviceHandle::<BlockingService, ChannelDeviceHandle>::new(device_id)
