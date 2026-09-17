@@ -56,3 +56,42 @@ impl core::fmt::Display for CubeTuneId {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CubeTuneId;
+    use alloc::string::ToString;
+    use cubecl_common::device::DeviceId;
+    use cubecl_ir::HardwareProperties;
+
+    #[test]
+    fn test_cube_tune_id_display_includes_last_level_cache_size() {
+        let id = CubeTuneId {
+            device: DeviceId::new(1, 2),
+            name: "test",
+            version: "3.4.5",
+            hardware: HardwareProperties {
+                load_width: 256,
+                plane_size_min: 32,
+                plane_size_max: 32,
+                max_bindings: 8,
+                max_shared_memory_size: 128,
+                max_cube_count: (1, 2, 3),
+                max_units_per_cube: 1024,
+                max_cube_dim: (4, 5, 6),
+                num_streaming_multiprocessors: Some(148),
+                num_cpu_cores: None,
+                last_level_cache_size: Some(512),
+                num_tensor_cores: Some(4),
+                min_tensor_cores_dim: Some(8),
+                max_vector_size: 16,
+                cube_mma_reserved_shared_memory: 64,
+            },
+        };
+
+        assert_eq!(
+            id.to_string(),
+            "device-1-2-test-v3.4.5-lw256-p32-32-bind8-smem128-cc1x2x3-units1024-cd4x5x6-sms148-cpu0-llc512-tc4-tcd8-vec16-mma64",
+        );
+    }
+}

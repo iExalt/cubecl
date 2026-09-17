@@ -209,3 +209,32 @@ pub trait AutotuneKey:
 }
 
 impl AutotuneKey for String {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tune::CloneInputGenerator;
+
+    fn candidate(name: &str, output: i32) -> Tunable<String, u32, i32> {
+        Tunable::new(name, move |_| Ok::<_, String>(output))
+    }
+
+    #[test]
+    fn explicit_reference_index_can_precede_later_candidates() {
+        let set = TunableSet::new(|_: &u32| String::from("key"), CloneInputGenerator)
+            .with(candidate("candidate", 1))
+            .with_reference(candidate("reference", 0))
+            .with(candidate("later", 1));
+
+        assert_eq!(set.reference_index(), 1);
+    }
+
+    #[test]
+    fn reference_index_defaults_to_last_candidate() {
+        let set = TunableSet::new(|_: &u32| String::from("key"), CloneInputGenerator)
+            .with(candidate("first", 1))
+            .with(candidate("last", 1));
+
+        assert_eq!(set.reference_index(), 1);
+    }
+}
