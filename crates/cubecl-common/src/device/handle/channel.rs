@@ -2038,9 +2038,15 @@ mod tests {
         shutdown_device_bounded_for_test(device_id, Duration::from_millis(10));
         assert_eq!(old_client.generation_status(), GenerationStatus::Closing);
 
+        // Use a different device so the second coordinator cannot force-close the replacement
+        // after the first coordinator releases the process-wide gate.
+        let second_device_id = DeviceId {
+            type_id: 0,
+            index_id: 1004,
+        };
         let (second_shutdown_done, second_shutdown_receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            shutdown_device_bounded_for_test(device_id, Duration::from_millis(10));
+            shutdown_device_bounded_for_test(second_device_id, Duration::from_millis(10));
             second_shutdown_done.send(()).unwrap();
         });
         second_shutdown_receiver
@@ -2089,6 +2095,60 @@ mod tests {
         assert!(error.message().is_none());
         assert!(error.into_panic().is_none());
         assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_shutdown_hook_panic_drops_state_before_replacement() {
+        struct PanicDropService {
+            dropped: Option<Arc<AtomicUsize>>,
+        }
+
+        impl DeviceService for PanicDropService {
+            fn init(_id: DeviceId) -> Self {
+                Self { dropped: None }
+            }
+
+            fn utilities(&self) -> ServerUtilitiesHandle {
+                Arc::new(())
+            }
+
+            fn shutdown(&mut self) {
+                panic!("shutdown hook failed");
+            }
+        }
+
+        impl Drop for PanicDropService {
+            fn drop(&mut self) {
+                if let Some(dropped) = &self.dropped {
+                    dropped.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let device_id = DeviceId {
+            type_id: 0,
+            index_id: 1005,
+        };
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let old = DeviceHandle::<PanicDropService, ChannelDeviceHandle>::insert(
+            device_id,
+            PanicDropService {
+                dropped: Some(Arc::clone(&dropped)),
+            },
+        )
+        .unwrap();
+        let old_generation = old.handle.state.client.generation_id();
+
+        shutdown_device_bounded_for_test(device_id, Duration::from_secs(1));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+
+        let replacement = DeviceHandle::<PanicDropService, ChannelDeviceHandle>::new(device_id);
+        assert_ne!(
+            old_generation,
+            replacement.handle.state.client.generation_id()
+        );
+        assert_eq!(replacement.submit_blocking(|_| 11).unwrap(), 11);
+        drop((old, replacement));
     }
 
     #[test]
