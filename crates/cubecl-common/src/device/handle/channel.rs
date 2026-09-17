@@ -1997,11 +1997,15 @@ mod tests {
     fn test_bounded_device_shutdown_leaves_closing_generation_until_drain() {
         struct BlockingService {
             gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+            shutdown_entered: Option<mpsc::Sender<()>>,
         }
 
         impl DeviceService for BlockingService {
             fn init(_id: DeviceId) -> Self {
-                Self { gate: None }
+                Self {
+                    gate: None,
+                    shutdown_entered: None,
+                }
             }
 
             fn utilities(&self) -> ServerUtilitiesHandle {
@@ -2009,6 +2013,9 @@ mod tests {
             }
 
             fn shutdown(&mut self) {
+                if let Some(sender) = self.shutdown_entered.take() {
+                    sender.send(()).unwrap();
+                }
                 let Some(gate) = self.gate.take() else {
                     return;
                 };
@@ -2025,18 +2032,26 @@ mod tests {
             index_id: 1002,
         };
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (shutdown_entered_tx, shutdown_entered_rx) = mpsc::channel();
         let handle = DeviceHandle::<BlockingService, ChannelDeviceHandle>::insert(
             device_id,
             BlockingService {
                 gate: Some(Arc::clone(&gate)),
+                shutdown_entered: Some(shutdown_entered_tx),
             },
         )
         .unwrap();
         let old_generation = handle.handle.state.client.generation_id();
         let old_client = handle.handle.state.client.clone();
 
-        shutdown_device_bounded_for_test(device_id, Duration::from_millis(10));
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_device_bounded_for_test(device_id, Duration::from_millis(10));
+        });
+        shutdown_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown coordinator should enter the service before timing out");
         assert_eq!(old_client.generation_status(), GenerationStatus::Closing);
+        shutdown_thread.join().unwrap();
 
         // Use a different device so the second coordinator cannot force-close the replacement
         // after the first coordinator releases the process-wide gate.
@@ -2101,11 +2116,17 @@ mod tests {
     fn test_shutdown_hook_panic_drops_state_before_replacement() {
         struct PanicDropService {
             dropped: Option<Arc<AtomicUsize>>,
+            drop_entered: Option<mpsc::Sender<()>>,
+            release_drop: Option<Arc<(Mutex<bool>, Condvar)>>,
         }
 
         impl DeviceService for PanicDropService {
             fn init(_id: DeviceId) -> Self {
-                Self { dropped: None }
+                Self {
+                    dropped: None,
+                    drop_entered: None,
+                    release_drop: None,
+                }
             }
 
             fn utilities(&self) -> ServerUtilitiesHandle {
@@ -2119,6 +2140,16 @@ mod tests {
 
         impl Drop for PanicDropService {
             fn drop(&mut self) {
+                if let Some(sender) = self.drop_entered.take() {
+                    sender.send(()).unwrap();
+                }
+                if let Some(gate) = self.release_drop.take() {
+                    let (lock, condition) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = condition.wait(released).unwrap();
+                    }
+                }
                 if let Some(dropped) = &self.dropped {
                     dropped.fetch_add(1, Ordering::SeqCst);
                 }
@@ -2130,19 +2161,49 @@ mod tests {
             index_id: 1005,
         };
         let dropped = Arc::new(AtomicUsize::new(0));
+        let (drop_entered_tx, drop_entered_rx) = mpsc::channel();
+        let release_drop = Arc::new((Mutex::new(false), Condvar::new()));
         let old = DeviceHandle::<PanicDropService, ChannelDeviceHandle>::insert(
             device_id,
             PanicDropService {
                 dropped: Some(Arc::clone(&dropped)),
+                drop_entered: Some(drop_entered_tx),
+                release_drop: Some(Arc::clone(&release_drop)),
             },
         )
         .unwrap();
         let old_generation = old.handle.state.client.generation_id();
 
-        shutdown_device_bounded_for_test(device_id, Duration::from_secs(1));
-        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_device_bounded_for_test(device_id, Duration::from_millis(10));
+        });
+        drop_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runner teardown should enter the service drop");
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
 
-        let replacement = DeviceHandle::<PanicDropService, ChannelDeviceHandle>::new(device_id);
+        let (replacement_started_tx, replacement_started_rx) = mpsc::channel();
+        let replacement = std::thread::spawn(move || {
+            let replacement = DeviceHandle::<PanicDropService, ChannelDeviceHandle>::new(device_id);
+            replacement_started_tx.send(()).unwrap();
+            replacement
+        });
+        assert!(
+            replacement_started_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "replacement must wait until the old generation has fully dropped"
+        );
+
+        let (lock, condition) = &*release_drop;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+        shutdown_thread.join().unwrap();
+        replacement_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement should initialize after teardown completes");
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let replacement = replacement.join().unwrap();
         assert_ne!(
             old_generation,
             replacement.handle.state.client.generation_id()
