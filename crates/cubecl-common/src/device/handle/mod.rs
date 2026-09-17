@@ -295,9 +295,11 @@ impl<S: ?Sized + 'static, I: DeviceHandleSpec> DeviceHandle<S, I> {
         self.handle.exclusive(task)
     }
 
-    /// Force-closes all background runner generations for `device_id`, blocking until they
-    /// exit. Queued tasks run before the threads stop. This invalidates live handles and values
-    /// retained from those generations; callers must stop using them before shutdown.
+    /// Force-closes all background runner generations for `device_id`. Queued tasks run before the
+    /// threads stop. This invalidates live handles and values retained from those generations;
+    /// callers must stop using them before shutdown. Channel-backed handles wait up to 30 seconds
+    /// for staged draining, then return while a coordinator continues to hold the shutdown gate
+    /// and generation pins. A runner thread cannot call this method synchronously.
     ///
     /// Only meaningful for handle implementations with background threads; a
     /// no-op otherwise.
