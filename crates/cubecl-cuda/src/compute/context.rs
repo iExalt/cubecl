@@ -19,7 +19,8 @@ use cubecl_core::{
     server::ResourceLimitError,
 };
 use cubecl_environment::persistence::Store;
-use cubecl_llvm::nvptx::ptx_version::PtxVersion;
+// Real when `llvm` is on, a stub otherwise; see compiler.rs.
+use crate::compiler::PtxVersion;
 use cubecl_server::{
     compiler::KernelCacheKey,
     kernel::{CompiledKernel, CubeKernel},
@@ -97,7 +98,9 @@ fn cache_namespace(
 ) -> String {
     match (backend, ptx_version) {
         (CudaBackend::Cpp, _) => format!("{fingerprint}-cpp"),
+        #[cfg(feature = "llvm")]
         (CudaBackend::Llvm, None) => format!("{fingerprint}-llvm"),
+        #[cfg(feature = "llvm")]
         (CudaBackend::Llvm, Some(ptx_version)) => format!("{fingerprint}-llvm-{ptx_version}"),
     }
 }
@@ -230,6 +233,7 @@ impl CudaContext {
             Some(CudaRepresentation::Cpp(_)) => {
                 self.load_transpiled(kernel_id, key, jitc_kernel, logger, recording)
             }
+            #[cfg(feature = "llvm")]
             Some(CudaRepresentation::Llvm(_)) => {
                 self.load_emitted_ptx(kernel_id, key, jitc_kernel, logger, recording)
             }
@@ -241,6 +245,7 @@ impl CudaContext {
                 CudaBackend::Cpp => {
                     self.load_transpiled(kernel_id, key, jitc_kernel, logger, recording)
                 }
+                #[cfg(feature = "llvm")]
                 CudaBackend::Llvm => Err(CompilationError::Generic {
                     reason: "the LLVM backend cannot load a precompiled kernel: it has no text to \
                          compile from"
@@ -257,6 +262,7 @@ impl CudaContext {
     /// What it hands back is already PTX, so no `nvrtc*` call belongs here: the bytes go
     /// straight to [`Self::load_ptx`], exactly as a cache hit would. The driver still JITs
     /// them when the module loads, which is what it does with NVRTC's output too.
+    #[cfg(feature = "llvm")]
     fn load_emitted_ptx(
         &mut self,
         kernel_id: &KernelId,

@@ -35,7 +35,9 @@ use cubecl_cpp::{
         register_scaled_mma_features, register_wmma_features,
     },
 };
-use cubecl_llvm::nvptx::ptx_version::PtxVersion;
+// Real when `llvm` is on, a stub otherwise; see compiler.rs.
+use crate::compiler::PtxVersion;
+#[cfg(feature = "llvm")]
 use cubecl_llvm::shared::lowered_features::{GpuTarget, restrict_features};
 use cubecl_server::{
     allocator::PitchedMemoryLayoutPolicy, logging::ServerLogger, runtime::Runtime,
@@ -368,6 +370,7 @@ impl DeviceService for CudaServer {
         // same point, and a feature the selected one cannot honour is a kernel that fails to
         // compile rather than a slower one.
         let backend = CudaBackend::default();
+        #[cfg(feature = "llvm")]
         if backend == CudaBackend::Llvm {
             restrict_features(&mut device_props, GpuTarget::Nvptx);
         }

@@ -23,7 +23,10 @@ default = [
     "cubecl-core/default",
 ]
 cpp = []
-pliron-dump = ["cubecl-cpp/pliron-dump", "cubecl-llvm/pliron-dump"]
+# The LLVM/pliron backend. Keep it out of `default`: feature unification through `cubecl/default` would switch it
+# back on for every build, and tracel-llvm-bundler's prebuilt LLVM doesn't link on aarch64 (see src/compiler.rs).
+llvm = ["dep:cubecl-llvm"]
+pliron-dump = ["cubecl-cpp/pliron-dump", "cubecl-llvm?/pliron-dump"]
 ptx-wmma = []
 persistence = ["cubecl-server/persistence"]
 std = [
@@ -56,7 +59,7 @@ cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.4", default-feat
 ] }
 cubecl-cpp = { path = "../cubecl-cpp", version = "=0.11.0-pre.4", default-features = false, features = [
 ] }
-cubecl-llvm = { path = "../cubecl-llvm", version = "=0.11.0-pre.4", default-features = false, features = [
+cubecl-llvm = { path = "../cubecl-llvm", version = "=0.11.0-pre.4", default-features = false, optional = true, features = [
     "std",
     "nvptx",
 ] }
