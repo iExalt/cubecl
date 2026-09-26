@@ -4,7 +4,27 @@ use cubecl_core::ir::nvidia::SmArch;
 use cubecl_core::prelude::KernelDefinition;
 use cubecl_cpp::shared::CompilationOptions;
 use cubecl_cpp::{ComputeKernel, shared::CppCompiler, target::Cuda};
-use cubecl_llvm::nvptx::ptx_version::PtxVersion;
+#[cfg(feature = "llvm")]
+pub use cubecl_llvm::nvptx::ptx_version::PtxVersion;
+// `llvm` gates the whole LLVM/pliron backend below. tracel-llvm-bundler's prebuilt LLVM 23.1
+// doesn't link on linux-aarch64 (undefined LLVMOrc*/LLVM_InitializeNative* references, although
+// the bundle's archives define them). The cpp/NVRTC backend never constructs a `PtxVersion`; this
+// stub only has to satisfy the type checker at the call sites that name the type.
+#[cfg(not(feature = "llvm"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PtxVersion;
+#[cfg(not(feature = "llvm"))]
+impl PtxVersion {
+    pub fn for_driver(_driver: i32) -> Option<Self> {
+        None
+    }
+}
+#[cfg(not(feature = "llvm"))]
+impl core::fmt::Display for PtxVersion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "none")
+    }
+}
 use cubecl_server::compiler::{CompilationError, Compiler};
 use cubecl_server::kernel::BufferIOAttr;
 
@@ -18,15 +38,24 @@ pub enum CudaBackend {
     /// Transpile to CUDA C++ and hand the source to NVRTC.
     Cpp,
     /// Lower through pliron and LLVM to PTX.
+    #[cfg(feature = "llvm")]
     Llvm,
 }
 
 impl Default for CudaBackend {
     fn default() -> Self {
-        if cfg!(feature = "cpp") {
+        #[cfg(feature = "llvm")]
+        {
+            if cfg!(feature = "cpp") {
+                CudaBackend::Cpp
+            } else {
+                CudaBackend::Llvm
+            }
+        }
+        // Only one variant exists in this configuration.
+        #[cfg(not(feature = "llvm"))]
+        {
             CudaBackend::Cpp
-        } else {
-            CudaBackend::Llvm
         }
     }
 }
@@ -34,6 +63,7 @@ impl Default for CudaBackend {
 #[derive(Clone, Debug)]
 pub enum CudaCompiler {
     Cpp(CppCompiler<Cuda>),
+    #[cfg(feature = "llvm")]
     Llvm(cubecl_llvm::PlironCompiler),
 }
 
@@ -41,6 +71,7 @@ impl CudaCompiler {
     pub fn new(backend: CudaBackend) -> Self {
         match backend {
             CudaBackend::Cpp => CudaCompiler::Cpp(CppCompiler::default()),
+            #[cfg(feature = "llvm")]
             CudaBackend::Llvm => CudaCompiler::Llvm(cubecl_llvm::PlironCompiler {
                 target: cubecl_llvm::LlvmTarget::Nvptx,
             }),
@@ -67,6 +98,7 @@ pub struct CudaCompilationOptions {
 
 pub enum CudaRepresentation {
     Cpp(ComputeKernel),
+    #[cfg(feature = "llvm")]
     Llvm(cubecl_llvm::NvptxModule),
 }
 
@@ -76,6 +108,7 @@ impl core::fmt::Debug for CudaRepresentation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             CudaRepresentation::Cpp(_) => f.write_str("CudaRepresentation::Cpp"),
+            #[cfg(feature = "llvm")]
             CudaRepresentation::Llvm(module) => f
                 .debug_tuple("CudaRepresentation::Llvm")
                 .field(module)
@@ -90,6 +123,7 @@ impl CudaRepresentation {
     pub fn shared_memory_size(&self) -> usize {
         match self {
             CudaRepresentation::Cpp(kernel) => kernel.shared_memory_size,
+            #[cfg(feature = "llvm")]
             CudaRepresentation::Llvm(module) => module.shared_memory_size,
         }
     }
@@ -99,6 +133,7 @@ impl core::fmt::Display for CudaRepresentation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             CudaRepresentation::Cpp(kernel) => write!(f, "{kernel}"),
+            #[cfg(feature = "llvm")]
             CudaRepresentation::Llvm(module) => write!(f, "{}", module.ir),
         }
     }
@@ -115,6 +150,7 @@ impl Compiler for CudaCompiler {
     fn buffer_io(repr: &Self::Representation) -> Option<Vec<BufferIOAttr>> {
         match repr {
             CudaRepresentation::Cpp(kernel) => <CppCompiler<Cuda> as Compiler>::buffer_io(kernel),
+            #[cfg(feature = "llvm")]
             CudaRepresentation::Llvm(module) => Some(module.io.clone()),
         }
     }
@@ -128,6 +164,7 @@ impl Compiler for CudaCompiler {
             CudaCompiler::Cpp(compiler) => Ok(CudaRepresentation::Cpp(
                 compiler.compile(kernel, &options.cpp)?,
             )),
+            #[cfg(feature = "llvm")]
             CudaCompiler::Llvm(compiler) => {
                 let pliron_options = cubecl_llvm::PlironOptions {
                     arch: None,
@@ -151,6 +188,7 @@ impl Compiler for CudaCompiler {
     fn extension(&self) -> &'static str {
         match self {
             CudaCompiler::Cpp(compiler) => compiler.extension(),
+            #[cfg(feature = "llvm")]
             CudaCompiler::Llvm(_) => "ll",
         }
     }
@@ -158,6 +196,7 @@ impl Compiler for CudaCompiler {
     fn lang_tag(&self) -> &'static str {
         match self {
             CudaCompiler::Cpp(compiler) => compiler.lang_tag(),
+            #[cfg(feature = "llvm")]
             CudaCompiler::Llvm(compiler) => compiler.lang_tag(),
         }
     }
