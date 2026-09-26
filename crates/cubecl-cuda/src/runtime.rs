@@ -414,9 +414,9 @@ fn tensor_cores_per_sm(arch: &CudaArchitecture) -> Option<u32> {
         return None;
     }
     match arch.version {
-        70 | 75 => Some(8),                           // Volta, Turing
-        80 | 86 | 89 | 90 | 91 | 92 | 100 => Some(4), // Ampere, Hopper, Blackwell
-        _ => None,                                    // Unknown or unsupported architecture
+        70 | 75 => Some(8),                                       // Volta, Turing
+        80 | 86 | 89 | 90 | 91 | 92 | 100 | 101 | 103 => Some(4), // Ampere, Hopper, Blackwell
+        _ => None, // Unknown or unsupported architecture
     }
 }
 
